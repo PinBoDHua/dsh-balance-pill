@@ -1,0 +1,64 @@
+{
+  "name": "dsh-balance-pill",
+  "version": "0.1.6",
+  "description": "余额徽章 —— 在 DeepSeek Harness 输入框下方状态行末尾显示账户余额，颜色随余额档位变化，并标出当前是高峰还是空闲计费时段（空闲单价为高峰的一半）；面板给出充值/赠金拆分、余额趋势、今日/本周/近 7 天与本轮会话消耗、峰谷预估与余额耗尽预估，掉档或时段切换时浮出提醒（看门狗会从休眠唤醒 / 校时后的时钟跳变中自愈，时段提醒的冷却按方向分账），并可在「设置 → 通用设置」里调整全部行为。",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "balance",
+    "ui"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/runtime.test.mjs",
+    "install:plugin": "node scripts/install.mjs",
+    "verify": "node scripts/build.mjs && node --test tests/runtime.test.mjs"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.4"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-api-remotes"
+      ],
+      "platform": "web"
+    },
+    "manifestVersion": 1
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./client/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client",
+    "src",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md"
+  ]
+}

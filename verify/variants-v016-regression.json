@@ -1,0 +1,26 @@
+[
+  {
+    "name": "v14-default",
+    "settings": { "showTariff": true, "showTrend": true, "showRate": true }
+  },
+  {
+    "name": "v14-today",
+    "seedHistory": true,
+    "steepHistory": true,
+    "settings": { "showTariff": true, "showTrend": false, "showRate": true }
+  },
+  {
+    "name": "v14-tariff",
+    "tariffCheck": true,
+    "settings": { "showTariff": true, "alertOnTariff": true, "tariffModel": "flash" }
+  },
+  {
+    "name": "v016-config-switch",
+    "configSwitchCheck": true,
+    "settings": { "showTariff": true, "alertOnTariff": false }
+  },
+  {
+    "name": "v14-no-tariff",
+    "settings": { "showTariff": false, "alertOnTariff": false }
+  }
+]

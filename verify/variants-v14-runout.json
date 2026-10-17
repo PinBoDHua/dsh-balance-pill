@@ -1,0 +1,9 @@
+[
+  {
+    "name": "v14-runout",
+    "seedHistory": true,
+    "steepHistory": true,
+    "runoutCheck": true,
+    "settings": { "showTariff": true, "showTrend": true, "showRate": true }
+  }
+]

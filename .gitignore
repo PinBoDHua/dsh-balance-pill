@@ -1,0 +1,23 @@
+# Dependencies / local installs
+node_modules/
+.pnpm-store/
+
+# Real-GUI verification runtime (Chromium profile, caches, cookies)
+verify/userdata/
+
+# Verification artifacts: large screenshots and raw DOM dumps stay local.
+# Only the images referenced by README/evidence docs are committed.
+verify/out/*
+!verify/out/montage-v12-panels.png
+!verify/out/v016-panel-crop.png
+
+# Logs / editor / OS noise
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local backups / scratch
+*.bak
+*~

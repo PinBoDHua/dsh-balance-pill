@@ -1,0 +1,4 @@
+[
+  { "name": "alert-cross", "crossLevel": true },
+  { "name": "stale", "blockAccount": true }
+]

@@ -1,0 +1,17 @@
+[
+  {
+    "name": "v016-default",
+    "seedHistory": true,
+    "seedDays": 3,
+    "expectRecentSpend": true,
+    "settings": { "showTariff": true, "showTrend": true, "showRate": true }
+  },
+  {
+    "name": "v016-dark",
+    "seedHistory": true,
+    "seedDays": 3,
+    "expectRecentSpend": true,
+    "dark": true,
+    "settings": { "showTariff": true, "showTrend": true, "showRate": true }
+  }
+]

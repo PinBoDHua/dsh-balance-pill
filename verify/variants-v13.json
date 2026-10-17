@@ -1,0 +1,20 @@
+[
+  {
+    "name": "v13-default",
+    "settings": { "showTariff": true, "alertOnTariff": false }
+  },
+  {
+    "name": "v13-tariff",
+    "tariffCheck": true,
+    "settings": { "showTariff": true, "alertOnTariff": true, "tariffModel": "flash" }
+  },
+  {
+    "name": "v13-balance-alert",
+    "balanceAlertCheck": true,
+    "settings": { "showTariff": true, "alertOnTariff": false }
+  },
+  {
+    "name": "v13-no-tariff",
+    "settings": { "showTariff": false, "alertOnTariff": false }
+  }
+]

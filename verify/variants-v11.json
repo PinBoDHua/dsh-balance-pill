@@ -1,0 +1,8 @@
+[
+  { "name": "default" },
+  { "name": "compact", "settings": { "compact": true } },
+  { "name": "bonus-only", "settings": { "format": "bonus" } },
+  { "name": "usd-preferred", "settings": { "currency": "USD" } },
+  { "name": "red", "settings": { "low": 100, "warn": 200 } },
+  { "name": "dark", "settings": { "low": 100, "warn": 200 }, "dark": true }
+]

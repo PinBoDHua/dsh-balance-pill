@@ -1,0 +1,691 @@
+/*
+ * 余额徽章 —— 样式表。
+ *
+ * 视觉目标是「看起来像宿主自己画的」：徽章沿用 ContextMeter 触发器与
+ * StatsPills 胶囊的同一套尺寸（13px 字号、20px 行高、1px 8px 内边距、
+ * tabular-nums），展开面板沿用宿主统计气泡面板的同一套表面与阴影令牌。
+ * 唯一新增的是档位配色：正常绿、偏低橙、不足红。
+ */
+
+/*
+ * 档位色定义在 `:root` 上，而不是只挂在 `.dbp_root` 上。
+ *
+ * 原因：展开面板是 portal 到 `document.body` 的，**不在 `.dbp_root` 子树里** ——
+ * 只在徽章上定义这三个变量，面板里的 `var(--dbp-warn)` 就会解析失败，而
+ * `color-mix(in srgb, var(--x) 14%, transparent)` 在变量无效时整条声明被丢弃，
+ * SVG 于是回落到继承色（黑板一样的黑色）。这在 v1.2 画趋势图时暴露出来。
+ *
+ * 挂到 `:root` 后徽章与面板共享同一份定义；`body[data-ds-dark-theme]` 的覆盖
+ * 本来就在根级，优先级仍然正确。
+ */
+:root {
+  /* 档位色：优先用主题令牌，令牌缺失时回落到自带色值。 */
+  --dbp-ok: var(--dsw-alias-state-success-primary, #1f8f5f);
+  --dbp-warn: #c07a12;
+  --dbp-low: var(--dsw-alias-state-error-primary, #d93a45);
+  /*
+   * 时段色（v1.3）：高峰 = 贵，用暖色；空闲 = 便宜，用绿色。
+   *
+   * 同样必须定义在 `:root` 上：面板 portal 到 `body`，`.dbp_tariffBadge` 不在
+   * `.dbp_root` 子树里，把变量挂在徽章上会让面板里的 `var()` 解析失败。
+   */
+  --dbp-peak: #c07a12;
+  --dbp-offpeak: var(--dsw-alias-state-success-primary, #1f8f5f);
+}
+
+body[data-ds-dark-theme] {
+  --dbp-ok: #4bbf8b;
+  --dbp-warn: #e2a13c;
+  --dbp-low: #f06a6a;
+  --dbp-peak: #e2a13c;
+  --dbp-offpeak: #4bbf8b;
+}
+
+.dbp_root {
+  /* 行内顺序：宿主两个统计胶囊是 order 0，上下文环（ContextMeter）也是 0，
+     这里用 order:1 把自己排到它们右侧，即整行末尾。 */
+  order: 1;
+  flex: none;
+  display: inline-flex;
+}
+
+.dbp_trigger {
+  box-sizing: border-box;
+  border: none;
+  background: 0 0;
+  padding: 1px 8px;
+  border-radius: var(--dsw-radius-sm);
+  font-family: inherit;
+  font-size: var(--dsh-content-font-size-secondary, 13px);
+  font-variant-numeric: tabular-nums;
+  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));
+  white-space: nowrap;
+  cursor: pointer;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--dsw-alias-label-tertiary);
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.dbp_trigger:focus-visible {
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+
+.dbp_text {
+  font-weight: 500;
+}
+
+.dbp_icon {
+  flex: none;
+  display: block;
+}
+
+/* ---------------------------------------------------------------- 档位配色 */
+
+.dbp_root[data-status='loading'] .dbp_trigger,
+.dbp_root[data-status='signed-out'] .dbp_trigger,
+.dbp_root[data-status='failed'] .dbp_trigger {
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ready 与 stale 用同一套档位色：stale 只是「这个数字可能过期」，
+   颜色仍然表达余额本身的高低，否则一次网络抖动会让红色警示凭空消失。 */
+.dbp_root[data-level='ok'][data-status='ready'] .dbp_trigger,
+.dbp_root[data-level='ok'][data-status='stale'] .dbp_trigger {
+  color: var(--dbp-ok);
+}
+
+.dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger,
+.dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger {
+  color: var(--dbp-warn);
+  background-color: color-mix(in srgb, var(--dbp-warn) 10%, transparent);
+}
+
+.dbp_root[data-level='low'][data-status='ready'] .dbp_trigger,
+.dbp_root[data-level='low'][data-status='stale'] .dbp_trigger {
+  color: var(--dbp-low);
+  background-color: color-mix(in srgb, var(--dbp-low) 12%, transparent);
+  font-weight: 600;
+}
+
+/* 过期态：档位色保留，但整体降一点不透明度，并给个虚线下划线，
+   让「数字还在、但不是最新」这件事在颜色之外还有第二个信号。 */
+.dbp_root[data-status='stale'] .dbp_trigger {
+  opacity: 0.75;
+}
+
+.dbp_root[data-status='stale'] .dbp_text {
+  text-decoration: underline dotted currentColor;
+  text-underline-offset: 3px;
+}
+
+.dbp_root[data-status='failed'] .dbp_trigger {
+  color: var(--dbp-warn);
+}
+
+.dbp_trigger:hover {
+  background-color: color-mix(in srgb, currentColor 14%, transparent);
+}
+
+.dbp_root[data-level='low'][data-status='ready'] .dbp_trigger:hover,
+.dbp_root[data-level='low'][data-status='stale'] .dbp_trigger:hover,
+.dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger:hover,
+.dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger:hover {
+  background-color: color-mix(in srgb, currentColor 20%, transparent);
+}
+
+/* ---------------------------------------------------------------- 展开面板 */
+
+.dbp_panel {
+  box-sizing: border-box;
+  position: fixed;
+  z-index: 1100;
+  /* 内容随历史/时段变多；小窗口或大字号下必须自己滚动，否则顶部会被视口裁掉。
+     内联样式会再按徽章上方的实际空间收紧 max-height（见 pill.js usePanelPosition）。 */
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 12px;
+  border: 0;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-specific-menu);
+  backdrop-filter: var(--dsw-menu-backdrop-filter);
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
+  box-shadow: var(--dsw-elevation-prominent);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 20px;
+  cursor: default;
+}
+
+.dbp_panelHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dbp_panelTitle {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* 面板标题旁的版本号：诊断用，弱化到不抢标题与刷新按钮。 */
+.dbp_panelVersion {
+  flex: none;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dbp_refresh {
+  box-sizing: border-box;
+  margin-left: auto;
+  padding: 0 8px;
+  height: 24px;
+  border: 0.5px solid var(--dsw-alias-border-l2);
+  border-radius: var(--dsw-radius-sm);
+  background: 0 0;
+  color: var(--dsw-alias-label-secondary);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 22px;
+  cursor: pointer;
+}
+
+.dbp_refresh:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.dbp_refresh:disabled {
+  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-tertiary));
+  cursor: default;
+}
+
+.dbp_refresh:focus-visible {
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+
+.dbp_rule {
+  height: 1px;
+  margin: 10px 0;
+  background: var(--dsw-alias-border-l1);
+}
+
+.dbp_rows {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 12px;
+  margin: 0;
+}
+
+.dbp_rows dt {
+  color: var(--dsw-alias-label-tertiary);
+  font-weight: 400;
+}
+
+.dbp_rows dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--dsw-alias-label-primary);
+}
+
+.dbp_totalKey {
+  padding-top: 4px;
+  color: var(--dsw-alias-label-secondary) !important;
+}
+
+.dbp_totalValue {
+  padding-top: 4px;
+  font-weight: 600;
+}
+
+.dbp_hint {
+  margin: 10px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.dbp_hint[data-level='ok'] {
+  color: var(--dbp-ok);
+}
+
+.dbp_hint[data-level='warn'] {
+  color: var(--dbp-warn);
+}
+
+.dbp_hint[data-level='low'] {
+  color: var(--dbp-low);
+}
+
+.dbp_message {
+  margin: 0;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dbp_stale {
+  margin: 0 0 8px;
+  padding: 5px 8px;
+  border-radius: var(--dsw-radius-sm);
+  background: color-mix(in srgb, var(--dbp-warn) 12%, transparent);
+  color: var(--dbp-warn);
+}
+
+.dbp_meta {
+  margin: 2px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+/* ------------------------------------------------------------ 会话消耗与趋势 */
+
+.dbp_spend {
+  margin: 8px 0 0;
+  padding: 5px 8px;
+  border-radius: var(--dsw-radius-sm);
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 今日已用：与「本轮会话」同一族信息，但**不加底纹** —— 底纹在面板里是
+   「这是你刚问的那件事」的强调，日消耗是背景信息，跟着一起高亮会稀释重点。 */
+.dbp_today {
+  margin: 6px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 本周已用：与「今日已用」同族同样式，仅 margin 与上一行拉开一点。 */
+.dbp_week {
+  margin: 4px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 近 7 天已用：与「本周」同族；再轻一点，避免三行消耗挤在一起抢注意力。 */
+.dbp_recent {
+  margin: 2px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.dbp_trend {
+  margin: 10px 0 0;
+}
+
+.dbp_spark {
+  display: block;
+  width: 100%;
+  height: 40px;
+}
+
+.dbp_sparkLine {
+  fill: none;
+  stroke: var(--dsw-alias-label-tertiary);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.dbp_sparkArea {
+  fill: color-mix(in srgb, var(--dsw-alias-label-tertiary) 14%, transparent);
+  stroke: none;
+}
+
+/* 余额在涨（充值）用 success 色，在跌（消耗）用 warning 色。 */
+.dbp_trend[data-tone='up'] .dbp_sparkLine {
+  stroke: var(--dbp-ok);
+}
+
+.dbp_trend[data-tone='up'] .dbp_sparkArea {
+  fill: color-mix(in srgb, var(--dbp-ok) 16%, transparent);
+}
+
+.dbp_trend[data-tone='down'] .dbp_sparkLine {
+  stroke: var(--dbp-warn);
+}
+
+.dbp_trend[data-tone='down'] .dbp_sparkArea {
+  fill: color-mix(in srgb, var(--dbp-warn) 14%, transparent);
+}
+
+.dbp_trendFoot {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- 计费时段 */
+
+/*
+ * 状态行徽章上的时段标签。11px 是「比徽章数字小一档、但仍看得清」的尺寸。
+ *
+ * 底色只用一成多的透明度：档位色（绿/橙/红）说的是「钱还够不够」，时段色说的是
+ * 「这个价贵不贵」，两件事不该混成一片抢注意力的色块，因此时段只做淡底 + 同色字。
+ * 颜色取自 `:root` 的 `--dbp-peak` / `--dbp-offpeak`（面板 portal 到 body，
+ * 变量挂在 `.dbp_root` 上的话面板里的徽标会取不到）。
+ */
+.dbp_tariff {
+  flex: none;
+  padding: 0 5px;
+  border-radius: var(--dsw-radius-sm);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.dbp_root[data-tariff='peak'] .dbp_tariff {
+  color: var(--dbp-peak);
+  background-color: color-mix(in srgb, var(--dbp-peak) 14%, transparent);
+}
+
+.dbp_root[data-tariff='off-peak'] .dbp_tariff {
+  color: var(--dbp-offpeak);
+  background-color: color-mix(in srgb, var(--dbp-offpeak) 14%, transparent);
+}
+
+/* 面板里的时段行：一枚徽标 + 一句结论，排在金额明细与档位提示之间。 */
+.dbp_tariffRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+}
+
+.dbp_tariffBadge {
+  flex: none;
+  padding: 0 5px;
+  border-radius: var(--dsw-radius-sm);
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.dbp_tariffBadge[data-tariff='peak'] {
+  color: var(--dbp-peak);
+  background: color-mix(in srgb, var(--dbp-peak) 14%, transparent);
+}
+
+.dbp_tariffBadge[data-tariff='off-peak'] {
+  color: var(--dbp-offpeak);
+  background: color-mix(in srgb, var(--dbp-offpeak) 14%, transparent);
+}
+
+/* 徽标后面那句结论：长句要能换行，因此允许收缩（flex 默认 min-width:auto 会撑破面板）。 */
+.dbp_tariffNote {
+  min-width: 0;
+}
+
+/* 时段明细行：倒计时、本段区间、价格、峰谷预估、日历覆盖。 */
+.dbp_tariffMeta {
+  margin: 2px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.dbp_topUp {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 32px;
+  margin-top: 10px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  color: var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary));
+  text-decoration: none;
+}
+
+.dbp_topUp:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.dbp_topUp:focus-visible {
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- 设置行 */
+
+/*
+ * 版式对齐宿主「设置 → 常规」里的行：上下 16px 内边距、底部 0.5px 分隔线、
+ * 左侧标题 14px + 描述 12px、右侧控件。最后一行由宿主的
+ * `[data-slot] > :last-child { border-bottom: none }` 处理，这里不用管。
+ */
+.dbp_setRoot {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.dbp_setHead {
+  padding: 4px 0 12px;
+}
+
+.dbp_setHeadTitle {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* 计费时段三行前面的分组说明：与根标题同版式，但要和上一行拉开距离（v1.3）。 */
+.dbp_setGroup {
+  padding: 14px 0 4px;
+}
+
+.dbp_setGroupTitle {
+  font-weight: 600;
+}
+
+.dbp_setRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 16px 0;
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
+}
+
+.dbp_setRow[data-disabled='true'] {
+  opacity: 0.6;
+}
+
+.dbp_setCopy {
+  min-width: 0;
+}
+
+.dbp_setTitle {
+  color: var(--dsw-alias-label-primary);
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.dbp_setDescription {
+  margin-top: 4px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.dbp_setControl {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+.dbp_setPair {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.dbp_setNotice {
+  margin-bottom: 4px;
+  padding: 8px 12px;
+  border-radius: var(--dsw-radius-md);
+  background: color-mix(in srgb, var(--dbp-warn) 12%, transparent);
+  color: var(--dbp-warn);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.dbp_select,
+.dbp_number {
+  box-sizing: border-box;
+  height: 32px;
+  padding: 0 8px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-1));
+  color: var(--dsw-alias-label-primary);
+  font-family: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dbp_select {
+  min-width: 168px;
+  max-width: 260px;
+}
+
+.dbp_number {
+  width: 72px;
+  text-align: right;
+}
+
+.dbp_select:hover,
+.dbp_number:hover {
+  border-color: var(--dsw-alias-border-l4);
+}
+
+.dbp_select:focus-visible,
+.dbp_number:focus-visible {
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+
+.dbp_check {
+  display: inline-flex;
+  align-items: center;
+}
+
+.dbp_check input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--dsw-alias-state-business-primary);
+  cursor: pointer;
+}
+
+.dbp_setFoot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-top: 14px;
+}
+
+.dbp_setButton {
+  box-sizing: border-box;
+  height: 32px;
+  padding: 0 14px;
+  border: 0.5px solid var(--dsw-alias-border-l3);
+  border-radius: var(--dsw-radius-md);
+  background: 0 0;
+  color: var(--dsw-alias-label-primary);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.dbp_setButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.dbp_setButton:focus-visible {
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+
+.dbp_setHint {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+/* 紧凑模式：徽章不带币种符号，去掉一点横向内边距。 */
+.dbp_root[data-compact='true'] .dbp_trigger {
+  padding: 1px 6px;
+}
+
+/* ---------------------------------------------------------------- 提醒卡片 */
+
+/*
+ * 只在宿主 primitives 的 Toast 拿不到时才出现（见 alert-toast.js）。
+ * 宿主 Toast 自己 portal 到 body 并占 z-index:1100；这张兜底卡片挂在
+ * `shell.overlay` 里（z-index:20 的浮层，子元素自带 pointer-events:auto），
+ * 因此定位用 absolute 贴右下角即可，不必自己抬层级。
+ */
+.dbp_alert {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 12px;
+  border-radius: var(--dsw-radius-lg);
+  background: var(--dsw-alias-toast-bg, var(--dsw-specific-menu));
+  color: var(--dsw-alias-toast-label, #fff);
+  box-shadow: var(--dsw-elevation-prominent);
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.dbp_alertText {
+  min-width: 0;
+}
+
+.dbp_alertAction {
+  flex: none;
+  height: 26px;
+  padding: 0 10px;
+  border: 0.5px solid currentColor;
+  border-radius: var(--dsw-radius-sm);
+  background: 0 0;
+  color: inherit;
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.dbp_alertAction:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.dbp_alertAction:focus-visible {
+  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
+  outline-offset: 1px;
+}
+
+.dbp_alert[data-level='low'] .dbp_alertAction {
+  color: var(--dbp-low);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dbp_trigger {
+    transition: none;
+  }
+}

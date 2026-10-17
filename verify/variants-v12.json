@@ -1,0 +1,6 @@
+[
+  { "name": "default", "seedHistory": true },
+  { "name": "no-trend", "seedHistory": true, "settings": { "showTrend": false, "showSessionSpend": false } },
+  { "name": "red", "seedHistory": true, "settings": { "low": 100, "warn": 200 } },
+  { "name": "dark", "seedHistory": true, "settings": { "low": 100, "warn": 200 }, "dark": true }
+]

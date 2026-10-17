@@ -1,0 +1,8 @@
+# dsh-balance-pill bundle patch —— 把「余额徽章」插入 profile 的层栈。
+#
+# 该条目只提供宿主侧的空壳（lib/index.js）：余额读取完全发生在浏览器侧，
+# 由客户端 bundle 通过已挂载的 `remote.account` Remote 命名空间完成，
+# 宿主侧不需要服务、路由或凭据处理。二者通过同一个包名 id 关联。
+- insert:
+    - id: ui-balance-pill
+      name: 'dsh-balance-pill'
