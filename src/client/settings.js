@@ -47,6 +47,25 @@ export const POLL_CHOICES = [0, 30000, 60000, 300000]
 /** 轮询间隔默认值：60 秒。 */
 export const DEFAULT_POLL_MS = 60000
 
+/**
+ * 刷新间隔下拉的完整选项列表（毫秒，升序）。
+ *
+ * 存储里的 `pollMs` 允许是任意 ≥5000 的值（`normalizePoll` 只把过密的抬到 5000，
+ * 并不对齐档位），因此它不一定落在 `POLL_CHOICES` 里 —— 而受控 `<select>` 的
+ * value 匹配不到任何 option 时会渲染成**空白**，用户会看到「刷新间隔什么都没选」。
+ * v0.3.0 起把当前值动态并进选项（排在排序正确的位置），存储里存过
+ * `15000` 这类自定义值的界面不再开天窗。
+ *
+ * @param currentMs - 当前配置里的轮询间隔。
+ * @returns 毫秒数组（升序，含 `currentMs`）。
+ */
+export function pollChoiceList(currentMs) {
+  const list = [...POLL_CHOICES]
+  const value = typeof currentMs === 'number' && Number.isFinite(currentMs) ? Math.round(currentMs) : null
+  if (value !== null && !list.includes(value)) list.push(value)
+  return list.sort((a, b) => a - b)
+}
+
 /** 距离上次读取多久之内不再重复请求（手动刷新与自动刷新共用）。 */
 export const MIN_REFRESH_GAP_MS = 10000
 

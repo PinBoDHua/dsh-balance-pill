@@ -313,6 +313,22 @@ body[data-ds-dark-theme] {
   font-variant-numeric: tabular-nums;
 }
 
+/* 最近充值（v0.2.0）：与「近 7 天」同族。入账是好消息，颜色跟随文本不额外
+   加重 —— 面板里带颜色的元素应该只在「需要决策」时出现。 */
+.dbp_topup {
+  margin: 2px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 余额跑道（v0.3.0）：与「近 7 天」同族的背景信息，同样不加底纹、不加重。
+   它是预测，不是事实，视觉上必须比金额明细更轻。 */
+.dbp_runway {
+  margin: 2px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
 .dbp_trend {
   margin: 10px 0 0;
 }

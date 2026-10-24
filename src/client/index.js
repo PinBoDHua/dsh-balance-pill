@@ -23,7 +23,7 @@
 
 import { createAccountClient } from './account.js'
 import { NS, createSettingsStore, loadSettings, resolveStorage } from './settings.js'
-import { createAlertStore } from './alert.js'
+import { createAlertState, createAlertStore } from './alert.js'
 import { BalanceAlert } from './alert-toast.js'
 import { en, zh } from './locales.js'
 import { BalancePill } from './pill.js'
@@ -150,6 +150,15 @@ export function apply(ctx) {
   // 它**必须**在这里构造（而不是在组件里）：提醒状态机要跨会话存活，
   // 而徽章所在的槽位是会话作用域的。
   service.tariff = createTariffWatcher({ alerts: service.alerts })
+
+  // 余额跨档提醒的**状态机**（v0.3.0 起住在 service 上，跨会话存活）。
+  //
+  // 它此前是徽章组件里的 ref：切换会话会把「已提醒过哪个档位 / 冷却从何时
+  // 起算」一起丢掉 —— 30 分钟的全局冷却被会话切换重置，余额在阈值附近时
+  // 跨几次会话就可能补出几张重复的卡。提醒本身显示在 root 作用域的浮层上
+  // （账号级事件），状态机也该有同样的生命周期。徽章侧惰性初始化同一字段，
+  // 便于测试替身不预建它也能工作；生产路径在这里创建，全插件共享一份。
+  service.balanceAlertState = createAlertState()
 
   // 挂到输入框下方的状态行末尾（宿主自己的统计胶囊是 order 0，上下文环也是 0，
   // 本条目 order 50 先排在它们之后，再由样式表里的 flex `order:1` 落到最右侧）。

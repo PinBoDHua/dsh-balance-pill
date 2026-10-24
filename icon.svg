@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="余额徽章">
+  <!-- 插件管理器卡片图标。绿色取自面板的 ok 档位令牌（#1f8f5f），
+       钱包造型与状态行徽章的 WalletIcon 同一语义。 -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#1f8f5f"/>
+  <rect x="12" y="21" width="40" height="24" rx="5" fill="none" stroke="#fff" stroke-width="3"/>
+  <path d="M12 27.5h40" stroke="#fff" stroke-width="3"/>
+  <circle cx="43" cy="37.5" r="3.2" fill="#fff"/>
+</svg>

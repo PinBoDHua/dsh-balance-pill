@@ -15,7 +15,7 @@
  * 之后，前面另给一句规则说明 —— 开关自己解释不了「为什么会有两个价」。
  */
 
-import { CURRENCIES, DEFAULT_SETTINGS, FORMATS, POLL_CHOICES, clampThresholdPatch } from './settings.js'
+import { CURRENCIES, DEFAULT_SETTINGS, FORMATS, clampThresholdPatch, pollChoiceList } from './settings.js'
 import { MODELS } from './pricing.js'
 import { formatThreshold } from './format.js'
 
@@ -242,7 +242,9 @@ export function BalanceSettingsRow(props) {
         onChange: (value) => {
           set({ pollMs: Number(value) })
         },
-        options: POLL_CHOICES.map((ms) => ({
+        // v0.3.0 起选项列表会把「不在档位里的当前值」动态并进去：存储里存过
+        // 15000 这类自定义值时，受控下拉否则会渲染成空白（没有任何选中项）。
+        options: pollChoiceList(settings.pollMs).map((ms) => ({
           value: String(ms),
           label: ms === 0 ? t('settings.poll.manual') : t('settings.poll.seconds', { count: ms / 1000 })
         }))

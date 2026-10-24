@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -68,11 +68,13 @@ const tariffAlert = await import(pathToFileURL(join(SRC, 'tariff-alert.js')).hre
 const tariffService = await import(pathToFileURL(join(SRC, 'tariff-service.js')).href)
 const { createAccountClient } = await import(pathToFileURL(join(SRC, 'account.js')).href)
 const { PLUGIN_VERSION } = await import(pathToFileURL(join(SRC, 'version.js')).href)
-const { BalancePill } = await import(pathToFileURL(join(SRC, 'pill.js')).href)
+const { BalancePill, BalancePanel } = await import(pathToFileURL(join(SRC, 'pill.js')).href)
 const { TrendSparkline } = await import(pathToFileURL(join(SRC, 'sparkline.js')).href)
 const { BalanceAlert } = await import(pathToFileURL(join(SRC, 'alert-toast.js')).href)
 const { zh, en } = await import(pathToFileURL(join(SRC, 'locales.js')).href)
 const { BalanceSettingsRow } = await import(pathToFileURL(join(SRC, 'settings-row.js')).href)
+// 宿主侧入口（lib/index.js）：版本一致性校验要用它（v0.3.0 起导出 version）。
+const libEntry = await import(pathToFileURL(join(ROOT, 'lib', 'index.js')).href)
 
 /** 测试用本地化函数：直接查词典并做 `{name}` 插值。 */
 function translator(dict = zh) {
@@ -535,6 +537,70 @@ test('spendInWindow 汇总近 7 天消耗，并沿用「充值不清零」的账
   }
   assert.equal(history.spendInWindow(samples, 'x', {}), null)
   assert.equal(history.spendInWindow(null, now, {}), null)
+})
+
+test('spendInWindow 带 dailyAverage，分母是覆盖天数（v0.2.0）', () => {
+  const now = bj('2026-10-17 12:00')
+  const day = 86400000
+  // 覆盖 6 天（firstAt=now-6d，lastAt=now-2d 之后再无样本）：跨度整 4 天 → 4 天。
+  const four = [
+    sample(now - 6 * day, 20),
+    sample(now - 6 * day + 3600000, 15),
+    sample(now - 4 * day, 50),
+    sample(now - 2 * day, 47)
+  ]
+  const a = history.spendInWindow(four, now, { windowMs: history.RECENT_WINDOW_MS })
+  assert.equal(a.spent, 8)
+  assert.equal(a.dailyAverage, 2, '8 / 4 天 = 2')
+
+  // 覆盖不足一天按一天算：两小时花 6，日均是 6 而不是被摊薄成 0.03。
+  const hour = [sample(now - 7200000, 10), sample(now, 4)]
+  const b = history.spendInWindow(hour, now, { windowMs: history.RECENT_WINDOW_MS })
+  assert.equal(b.dailyAverage, 6)
+
+  // 只跌不涨时 spent=0，dailyAverage 同步为 0（行不渲染，但形状必须自洽）。
+  const flat = [sample(now - day, 10), sample(now, 10)]
+  const c = history.spendInWindow(flat, now, { windowMs: history.RECENT_WINDOW_MS })
+  assert.equal(c.spent, 0)
+  assert.equal(c.dailyAverage, 0)
+})
+
+test('lastTopUpFromSamples 找出最近一次入账（v0.2.0）', () => {
+  const now = bj('2026-10-17 12:00')
+  const day = 86400000
+  // 花 5 → 充 20（10-15）→ 又充 10（10-16）→ 花 3：最近一次入账是 +10。
+  const samples = [
+    sample(now - 4 * day, 20),
+    sample(now - 4 * day + 3600000, 15),
+    sample(now - 2 * day - 3600000, 35),
+    sample(now - 1 * day - 3600000, 45),
+    sample(now, 42)
+  ]
+  const topUp = history.lastTopUpFromSamples(samples, {})
+  assert.equal(topUp.amount, 10)
+  assert.equal(topUp.at, now - 1 * day - 3600000)
+  assert.equal(topUp.currency, 'CNY')
+
+  // 只跌不涨：没有可识别的入账。
+  const dropping = [sample(now - day, 20), sample(now, 15)]
+  assert.equal(history.lastTopUpFromSamples(dropping, {}), null)
+
+  // 口径过滤：口径切换造成的跳变不是充值。
+  const mixed = [sample(now - day, 20, 'CNY', 'total'), sample(now, 2, 'CNY', 'recharge')]
+  assert.equal(history.lastTopUpFromSamples(mixed, { basis: 'total' }), null)
+  // 币种过滤：换币种重开历史也不是充值。
+  const switched = [sample(now - day, 20, 'CNY'), sample(now, 50, 'USD')]
+  assert.equal(history.lastTopUpFromSamples(switched, { currency: 'CNY' }), null)
+
+  // 乱序输入先排序再扫；同毫秒去重保留最后一条。
+  const shuffled = [sample(now, 42), sample(now - day, 45), sample(now - day - 1000, 35)]
+  const fromShuffled = history.lastTopUpFromSamples(shuffled, {})
+  assert.equal(fromShuffled.amount, 10)
+
+  // 垃圾输入与不足两个样本：null，绝不抛错。
+  assert.equal(history.lastTopUpFromSamples(null, {}), null)
+  assert.equal(history.lastTopUpFromSamples([sample(now, 10)], {}), null)
+  assert.equal(history.lastTopUpFromSamples([sample(now, 10), null, 'x'], {}), null)
 })
 
 test('spendInDay / spendInWeek 在缺省 basis/currency 时不做过滤（v1.5 E 组）', () => {
@@ -1466,7 +1532,11 @@ test('formatCountdown 给到「小时 + 分钟」两级', () => {
     `${t('duration.days', { count: 1 })} ${t('duration.minutes', { count: 30 })}`
   )
   assert.equal(format.formatCountdown(24 * 3600000, t), t('duration.days', { count: 1 }))
-  assert.equal(format.formatCountdown(0, t), t('duration.unknown'))
+  // v0.2.0：恰好为 0 不再闪「暂时无法估算」—— `msUntil*` 都是 Math.max(0, …)，
+  // 边界那一拍会得到 0，旧实现把它与 NaN 一起归进 unknown。
+  assert.equal(format.formatCountdown(0, t), t('duration.seconds', { count: 1 }))
+  assert.equal(format.formatCountdown(-1, t), t('duration.unknown'))
+  assert.equal(format.formatCountdown(NaN, t), t('duration.unknown'))
 })
 
 test('formatPeakWindow 跨天时带上「次日 / N 天后」', () => {
@@ -1643,8 +1713,17 @@ test('每个词条的占位符在中英两版里一致', () => {
   }
 })
 
-test('v1.5 / v0.1.6 新增词条存在且参数完整', () => {
-  for (const key of ['panel.weekSpend', 'panel.rateOffPeak', 'panel.todaySpend', 'pill.runout', 'panel.recentSpend']) {
+test('v1.5 / v0.1.6 / v0.2.0 新增词条存在且参数完整', () => {
+  for (const key of [
+    'panel.weekSpend',
+    'panel.rateOffPeak',
+    'panel.todaySpend',
+    'pill.runout',
+    'panel.recentSpend',
+    // v0.2.0
+    'panel.lastTopUp',
+    'panel.runoutAt'
+  ]) {
     assert.ok(zh[key] !== undefined, `缺少中文词条 ${key}`)
     assert.ok(en[key] !== undefined, `缺少英文词条 ${key}`)
   }
@@ -1652,11 +1731,14 @@ test('v1.5 / v0.1.6 新增词条存在且参数完整', () => {
     [...String(zh['panel.weekSpend']).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort(),
     ['amount', 'time']
   )
+  // v0.2.0：「近 7 天」行多了日均。
   assert.deepEqual(
     [...String(zh['panel.recentSpend']).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort(),
-    ['amount', 'time']
+    ['amount', 'daily', 'time']
   )
   assert.deepEqual([...String(zh['pill.runout']).matchAll(/\{(\w+)\}/g)].map((m) => m[1]), ['time'])
+  assert.deepEqual([...String(zh['panel.lastTopUp']).matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort(), ['amount', 'time'])
+  assert.deepEqual([...String(zh['panel.runoutAt']).matchAll(/\{(\w+)\}/g)].map((m) => m[1]), ['time'])
 })
 
 test('词典没有空值', () => {
@@ -1681,7 +1763,7 @@ test('styles.css 把档位与时段色变量定义在 :root（portal 到 body �
 test('styles.css 覆盖深色主题并含全部关键类名', () => {
   const css = readFileSync(join(SRC, 'styles.css'), 'utf8')
   assert.match(css, /body\[data-ds-dark-theme\]/)
-  for (const cls of ['.dbp_root', '.dbp_trigger', '.dbp_panel', '.dbp_tariff', '.dbp_spark', '.dbp_alert', '.dbp_today', '.dbp_week', '.dbp_recent', '.dbp_panelVersion']) {
+  for (const cls of ['.dbp_root', '.dbp_trigger', '.dbp_panel', '.dbp_tariff', '.dbp_spark', '.dbp_alert', '.dbp_today', '.dbp_week', '.dbp_recent', '.dbp_topup', '.dbp_panelVersion']) {
     assert.ok(css.includes(cls), `样式表缺少 ${cls}`)
   }
   // v0.1.6：小窗口下面板自己滚动，而不是把顶部裁掉。
@@ -1876,7 +1958,21 @@ test('产物里的存储键与挂载点标记齐全', () => {
     'PLUGIN_VERSION',
     'configKey',
     'formatBillingMoment',
-    'RATE_MAX_ELAPSED_MS'
+    'RATE_MAX_ELAPSED_MS',
+    // v0.2.0
+    'data-balance-last-topup',
+    'lastTopUpFromSamples',
+    'dailyAverage',
+    'recordReading',
+    'panel.runoutAt',
+    'panel.lastTopUp',
+    // v0.3.0
+    'service.balanceAlertState',
+    'data-balance-runway',
+    'panel.runway',
+    'runwayOf',
+    'FUTURE_SKEW_MS',
+    'pollChoiceList'
   ]) {
     assert.ok(code.includes(marker), `产物里缺少 ${marker}`)
   }
@@ -1899,7 +1995,7 @@ test('构建脚本能跑通，且产物与源码同步', () => {
   assert.equal(readFileSync(BUNDLE, 'utf8'), before, '产物与源码不同步 —— 源码改了但没重新构建')
 })
 
-test('package.json / CHANGELOG / 面板版本常量三处一致', () => {
+test('package.json / CHANGELOG / 面板版本常量 / 宿主入口四处一致', () => {
   const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/)
   const changelog = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8')
@@ -1907,6 +2003,10 @@ test('package.json / CHANGELOG / 面板版本常量三处一致', () => {
   assert.ok(top !== null, 'CHANGELOG 里应有版本标题')
   assert.equal(top[1], pkg.version, 'CHANGELOG 的最新版本应与 package.json 一致')
   assert.equal(PLUGIN_VERSION, pkg.version, '面板显示的版本必须与 package.json 一致')
+  // v0.3.0：宿主侧入口也导出 version（install.mjs --status 与宿主诊断用），
+  // 构建脚本同样校验这条 —— 测试与构建互为第二道网。
+  assert.equal(libEntry.version, pkg.version, 'lib/index.js 的 version 必须与 package.json 一致')
+  assert.equal(libEntry.name, pkg.name)
 })
 
 // ============================================================ 看门狗（自愈）
@@ -2026,6 +2126,61 @@ test('pill.js 的两条 v0.1.6 接线还在（速度保留 / 配置键）', () =
   assert.match(source, /configKey:\s*`\$\{current\.format\}/)
 })
 
+test('pill.js 的 v0.2.0 接线还在（读数槽位 / 最近充值 / 日均 / 耗尽后缀）', () => {
+  const source = readFileSync(join(SRC, 'pill.js'), 'utf8')
+  // publish 成功读数必须写共享读数槽位：readings.js 的写入端在 v1.4 建好后
+  // 从未被调用过，看门狗的峰谷预估因此全部静默为空 —— 这条锚住修复不回退。
+  assert.match(source, /recordReading\(\{/)
+  // 面板「最近充值」走 lastTopUpFromSamples；「近 7 天」行带 dailyAverage。
+  assert.match(source, /lastTopUpFromSamples\(samples/)
+  assert.match(source, /daily:\s*formatMoney\(recent\.dailyAverage/)
+  // 速度行在 24 小时内耗尽时追加「约 {time} 耗尽」。
+  assert.match(source, /panel\.runoutAt/)
+})
+
+test('readings 槽位：record / latest / reset，非法金额整体忽略（v0.2.0）', async () => {
+  const readings = await import(pathToFileURL(join(SRC, 'readings.js')).href)
+  readings.resetReading()
+  assert.equal(readings.latestReading(), null)
+  readings.recordReading({ amount: 12.5, currency: 'CNY', at: 123, perHour: 1.5 })
+  assert.deepEqual(readings.latestReading(), { amount: 12.5, currency: 'CNY', at: 123, perHour: 1.5 })
+  // 覆盖写；currency 缺省空串、perHour 非正归 null（与 balance.js 的口径一致）。
+  readings.recordReading({ amount: 10, at: 456, perHour: 0 })
+  assert.deepEqual(readings.latestReading(), { amount: 10, currency: '', at: 456, perHour: null })
+  // 非法金额的写入被整体忽略（不能只更新部分字段）。
+  readings.recordReading({ amount: Number.NaN, at: 789 })
+  assert.equal(readings.latestReading().at, 456)
+  readings.recordReading(null)
+  assert.equal(readings.latestReading().at, 456)
+  readings.resetReading()
+  assert.equal(readings.latestReading(), null)
+})
+
+test('CLIENT_VERSION 跟随宿主 0.2.x 系列（v0.2.0 对齐 0.2.1）', () => {
+  // v0.2.0 审计发现上报版本停留在 0.2.0-rc.2，而宿主已发布 0.2.1-rc.1；
+  // 该版本只用于平台侧统计界面来源，不参与鉴权，但过期会让统计失真。
+  assert.equal(balance.CLIENT_VERSION, '0.2.1')
+})
+
+test('候选边界缓存：同一天结果一致，自定义日历绕过缓存（v0.2.0）', () => {
+  const friday = bj('2026-10-16 10:00')
+  const first = pricing.pricingSnapshot({ now: friday })
+  const second = pricing.pricingSnapshot({ now: friday + 12345 })
+  // 缓存命中的那次调用，边界结论必须与首次完全一致。
+  assert.equal(second.nextPeakAt, first.nextPeakAt)
+  assert.equal(second.nextOffPeakAt, first.nextOffPeakAt)
+  assert.deepEqual(second.offPeakWindow, first.offPeakWindow)
+  assert.equal(second.reason, first.reason)
+
+  // 自定义日历必须绕过缓存：同一时刻、两张不同的表，结论必须跟着表走 ——
+  // 若把第一张表的结果喂给第二张，调休补班日会被静默判成空闲。
+  const saturday = bj('2026-10-17 10:00')
+  const empty = pricing.pricingSnapshot({ now: saturday, holidays: {} })
+  const makeup = pricing.pricingSnapshot({ now: saturday, holidays: { '2026-10-17': 0 } })
+  assert.equal(empty.period, 'off-peak')
+  assert.equal(makeup.period, 'peak')
+})
+
 test('组件导出形状正确', () => {
   for (const component of [BalancePill, BalanceSettingsRow, TrendSparkline, BalanceAlert]) {
     assert.equal(typeof component, 'function')
@@ -2039,4 +2194,181 @@ test('产物里带着价格表与节假日数据', () => {
   assert.ok(code.includes('27'), 'pro 的高峰输出单价应在产物里')
   // 节假日数据在产物里（抽查 2026 国庆）。
   assert.ok(code.includes('2026-10-01'), '节假日日历应打进产物')
+})
+
+// ================================================================ v0.3.0
+
+test('runwayOf 按日均估算可用天数，超出 30 天不展示（v0.3.0）', () => {
+  // 用二进制精确的数字断言等式（19.1 / 1.91 会得到 10.000000000000002）。
+  assert.equal(history.runwayOf(10, 2), 5)
+  assert.equal(history.runwayOf(19.1, 1.91) > 9.99 && history.runwayOf(19.1, 1.91) < 10.01, true)
+  // 带小数的天数原样返回，格式化交给展示层。
+  assert.equal(history.runwayOf(5, 2), 2.5)
+  // 余额 / 日均任一非正或非法都不给结论 —— 「不知道」不冒充一个数。
+  assert.equal(history.runwayOf(0, 1.91), null)
+  assert.equal(history.runwayOf(-5, 1.91), null)
+  assert.equal(history.runwayOf(19.1, 0), null)
+  assert.equal(history.runwayOf(null, 1.91), null)
+  assert.equal(history.runwayOf(19.1, null), null)
+  assert.equal(history.runwayOf('19.1', 1.91), null)
+  // 超出展示窗口（RUNWAY_MAX_DAYS = 30）返回 null：天天挂一句
+  // 「还能用 300 天」只是噪音，与耗尽预估只看 24 小时内是同一条纪律。
+  assert.equal(history.runwayOf(100, 1), null)
+  assert.equal(history.runwayOf(30, 1), 30, '恰好 30 天仍要展示（边界含在内）')
+})
+
+test('normalizeHistory 丢弃落在未来的样本（时钟回拨防护，v0.3.0）', () => {
+  const now = 1_000_000_000
+  const skew = now + history.FUTURE_SKEW_MS
+  // 留 5 分钟余量是给写/读两端的时钟误差；超过它的只可能是坏数据。
+  const ok = history.normalizeHistory([sample(now - 5000, 10), sample(skew - 1, 9)], now)
+  assert.deepEqual(ok.map((s) => s.amount), [10, 9])
+  const cleaned = history.normalizeHistory([sample(now - 5000, 10), sample(skew + 1, 99)], now)
+  assert.deepEqual(cleaned.map((s) => s.amount), [10])
+})
+
+test('appendSample 拒绝未来时刻的新样本（v0.3.0）', () => {
+  const now = 1_000_000_000
+  const base = history.appendSample([], sample(now - 120000, 10), now)
+  const next = history.appendSample(base, sample(now + history.FUTURE_SKEW_MS + 1, 8), now)
+  assert.equal(next.length, 1)
+  assert.equal(next[0].amount, 10, '未来样本不得进入历史，否则历史从此停止前进')
+})
+
+test('pollChoiceList 把非档位的当前值并进选项并保持升序（v0.3.0）', () => {
+  // 档位内的值原样返回。
+  assert.deepEqual(settingsModule.pollChoiceList(60000), [0, 30000, 60000, 300000])
+  // 存储里存过 15000（归一化允许任意 ≥5000）时，受控下拉否则开天窗。
+  assert.deepEqual(settingsModule.pollChoiceList(15000), [0, 15000, 30000, 60000, 300000])
+  assert.deepEqual(settingsModule.pollChoiceList(5000), [0, 5000, 30000, 60000, 300000])
+  // 非法输入退回纯档位列表。
+  assert.deepEqual(settingsModule.pollChoiceList(Number.NaN), [0, 30000, 60000, 300000])
+  assert.deepEqual(settingsModule.pollChoiceList('60000'), [0, 30000, 60000, 300000])
+})
+
+/** 组一份可直接渲染 BalancePanel 的最小视图模型。 */
+function runwayModel(primary) {
+  return {
+    status: 'ready',
+    signedIn: true,
+    summary: {
+      currency: 'CNY',
+      recharge: primary,
+      bonus: 0,
+      total: primary,
+      primary,
+      wallets: [],
+      bonusWallets: [],
+      otherWallets: []
+    },
+    format: 'total',
+    primary,
+    level: 'ok',
+    thresholds: { low: 3, warn: 10 },
+    topUpUrl: null,
+    at: Date.now(),
+    ageMs: 0,
+    stale: false,
+    rate: null,
+    effective: true
+  }
+}
+
+test('面板「余额跑道」行：出现、缺席与跟随 showRate（v0.3.0）', () => {
+  const settings = { ...settingsModule.DEFAULT_SETTINGS }
+  const derived = (dailyAverage) => ({
+    trend: null,
+    spend: null,
+    today: null,
+    week: null,
+    recent:
+      dailyAverage === null
+        ? null
+        : { spent: dailyAverage * 7, dailyAverage, currency: 'CNY', firstAt: 1, lastAt: 2, samples: 10 },
+    lastTopUp: null
+  })
+  const render = (model, derivedArg, overrides = {}) =>
+    BalancePanel({
+      model,
+      settings: { ...settings, ...overrides },
+      locale: 'zh-CN',
+      t,
+      busy: false,
+      onRefresh: () => {},
+      position: null,
+      panelRef: { current: null },
+      derived: derivedArg,
+      pricing: null
+    })
+  const runwayOf = (tree) => findAll(tree, (node) => node.props?.['data-balance-runway'] === true)
+
+  // 日均 ¥1.91、余额 ¥19.10 → 约 10 天 → 展示。
+  const shown = runwayOf(render(runwayModel(19.1), derived(1.91)))
+  assert.equal(shown.length, 1)
+  assert.ok(String(shown[0].props.children).includes('1.91'), '跑道行要带日均金额')
+
+  // 跑道超出 30 天 → 不渲染（runwayOf 的上限，面板不再判一次）。
+  assert.equal(runwayOf(render(runwayModel(100), derived(1))).length, 0)
+
+  // 没有「近 7 天」统计（样本不足）→ 不渲染。
+  assert.equal(runwayOf(render(runwayModel(19.1), derived(null))).length, 0)
+
+  // 关掉「显示消耗速度」→ 不渲染（与耗尽预估同一开关，不新增设置项）。
+  assert.equal(runwayOf(render(runwayModel(19.1), derived(1.91), { showRate: false })).length, 0)
+})
+
+test('面板规则行与设置说明不再写死 ¥（v0.3.0）', () => {
+  // 词条模板里不再有「¥{」：符号由组件按当前钱包币种给出。
+  assert.ok(!zh['panel.rule'].includes('¥{'), 'panel.rule 不该写死 ¥')
+  assert.ok(!zh['settings.thresholds.description'].includes('¥{'))
+  assert.ok(!en['panel.rule'].includes('¥{'))
+  assert.ok(!en['settings.thresholds.description'].includes('¥{'))
+
+  // 渲染：人民币钱包 → 规则行带 ¥；无读数 → 只给数字。
+  const settings = { ...settingsModule.DEFAULT_SETTINGS }
+  const render = (model) =>
+    BalancePanel({
+      model,
+      settings,
+      locale: 'zh-CN',
+      t,
+      busy: false,
+      onRefresh: () => {},
+      position: null,
+      panelRef: { current: null },
+      derived: { trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null },
+      pricing: null
+    })
+  const ruleText = (model) => {
+    const nodes = findAll(render(model), (node) => node.props?.className === 'dbp_meta' && node.props?.key === 'rule-text')
+    assert.equal(nodes.length, 1)
+    return String(nodes[0].props.children)
+  }
+  assert.ok(ruleText(runwayModel(19.1)).includes('¥3'), '人民币钱包的规则行应带 ¥ 符号')
+  assert.ok(!ruleText(null).includes('¥'), '没有读数时规则行不该冒充一个币种')
+})
+
+test('v0.3.0 接线：余额提醒状态机由 service 持有（跨会话存活）', () => {
+  const pillSrc = readFileSync(join(SRC, 'pill.js'), 'utf8')
+  // 写入端与回写端都要在：advanceAlert 是纯函数，漏掉回写等于没修。
+  assert.ok(pillSrc.includes('service.balanceAlertState ?? (service.balanceAlertState = createAlertState())'))
+  assert.ok(pillSrc.includes('service.balanceAlertState = outcome.state'))
+  assert.ok(!pillSrc.includes('React.useRef(createAlertState())'), '状态机不得再住在组件 ref 里')
+  const indexSrc = readFileSync(join(SRC, 'index.js'), 'utf8')
+  assert.ok(indexSrc.includes('service.balanceAlertState = createAlertState()'), '入口应创建账号级状态机')
+})
+
+test('「余额跑道」等新词条键在中英两版里都有（v0.3.0）', () => {
+  for (const key of ['panel.runway']) {
+    assert.ok(typeof zh[key] === 'string', `zh 缺少 ${key}`)
+    assert.ok(typeof en[key] === 'string', `en 缺少 ${key}`)
+  }
+  assert.ok(zh['panel.runway'].includes('{duration}'))
+})
+
+test('package.json 声明图标且文件真实存在（v0.3.0）', () => {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  assert.equal(pkg.icon, './icon.svg')
+  assert.ok(pkg.files.includes('icon.svg'), '发布文件清单应包含 icon.svg')
+  assert.ok(existsSync(join(ROOT, 'icon.svg')), 'icon.svg 应真实存在')
 })

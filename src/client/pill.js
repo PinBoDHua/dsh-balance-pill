@@ -16,6 +16,10 @@
  * v1.3 增加计费时段（高峰 / 空闲）：徽章上挂一枚时段徽标，面板里补一组时段区块。
  * 时段判定全部来自 `pricing.js`（纯函数），这里只负责「什么时候重算」与「怎么显示」——
  * 面板打开时用秒级心跳重算倒计时，关着时按 30 秒分桶，别让徽章在后台白烧 CPU。
+ *
+ * v0.3.0：跨档提醒的状态机提升为账号级（`service.balanceAlertState`，跨会话存活）；
+ * 面板新增「余额跑道」行（按近 7 天日均估算可用天数）；规则行的阈值带上当前
+ * 钱包币种的符号（词条不再写死 ¥）。`BalancePanel` 显式导出供单测渲染。
  */
 
 import { rateBaseline, refreshedViewModel, viewModel } from './balance.js'
@@ -28,13 +32,16 @@ import {
   RECENT_WINDOW_MS,
   appendSample,
   downsample,
+  lastTopUpFromSamples,
   loadHistory,
+  runwayOf,
   saveHistory,
   spendInDay,
   spendInWeek,
   spendInWindow,
   withinWindow
 } from './history.js'
+import { recordReading } from './readings.js'
 import { loadBaselines, pruneBaselines, recordBaseline, saveBaselines, sessionSpend } from './session-spend.js'
 import { advanceAlert, createAlertState } from './alert.js'
 import {
@@ -48,7 +55,8 @@ import {
   formatDuration,
   formatMoney,
   formatMoneyDelta,
-  formatThreshold
+  formatThreshold,
+  currencySymbol
 } from './format.js'
 import { AlertIcon, WalletIcon } from './icons.js'
 import { TrendSparkline } from './sparkline.js'
@@ -77,15 +85,14 @@ function useSettingValue(store) {
   return value
 }
 
-/** 币种前缀；紧凑模式返回空串。 */
+/**
+ * 币种前缀；紧凑模式返回空串。
+ *
+ * v0.3.0 起直接复用 `format.js` 的 `currencySymbol`：两处此前各写了一份
+ * 「CNY→¥ / USD→$ / 其他→代码」的映射，改币种展示要同步两处。
+ */
 function currencyPrefix(currency, settings) {
-  if (settings.compact !== true) {
-    if (currency === 'CNY') return '¥'
-    if (currency === 'USD') return '$'
-    if (typeof currency === 'string' && currency !== '') return `${currency} `
-    return ''
-  }
-  return ''
+  return settings.compact === true ? '' : currencySymbol(currency)
 }
 
 /**
@@ -175,10 +182,8 @@ function useBalance(service, sessionId, open) {
   const history = React.useRef(null)
   /** 每个会话的基准余额，用于算「本轮花了多少」。 */
   const baselines = React.useRef(null)
-  /** 跨档提醒的状态机。 */
-  const alertState = React.useRef(createAlertState())
   /** 面板打开时才画趋势图，避免无人观看时也做降采样与重渲染。 */
-  const [derived, setDerived] = React.useState({ trend: null, spend: null, today: null, week: null, recent: null })
+  const [derived, setDerived] = React.useState({ trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null })
 
   if (history.current === null) history.current = loadHistory(service.storage)
   if (baselines.current === null) baselines.current = loadBaselines(service.storage)
@@ -227,6 +232,18 @@ function useBalance(service, sessionId, open) {
       history.current = appendSample(history.current ?? [], reading)
       saveHistory(history.current, service.storage)
 
+      // 1b) 共享读数槽位（v0.2.0 接线）：`readings.js` 的写入端在 v1.4 建好后
+      //     一直没接上 —— `latestReading()` 恒为 null，`shell.overlay` 上的时段
+      //     看门狗拿到的快照里余额与速度永远是空的，峰谷预估全部静默为 null。
+      //     徽章每次成功读数都把「金额 + 币种 + 时刻 + 速度」写进去，看门狗
+      //     tick 时即可读到与徽章同一口径的最近读数（见 index.js 的 run）。
+      recordReading({
+        at: reading.at,
+        amount: reading.amount,
+        currency: reading.currency,
+        perHour: model.rate?.perHour ?? null
+      })
+
       // 2) 会话基准：本会话第一次看到余额时记下，之后用「当前 - 基准」算本轮消耗。
       baselines.current = recordBaseline(baselines.current ?? {}, sessionId, reading)
       baselines.current = pruneBaselines(baselines.current)
@@ -236,12 +253,20 @@ function useBalance(service, sessionId, open) {
       //    提醒写进共享 store（不是组件 state）—— 徽章是会话作用域的，
       //    切换会话会卸载重挂，放在组件里的提醒会被顺手清掉。
       //
+      //    v0.3.0 起状态机本身也提升为**账号级**（`service.balanceAlertState`，
+      //    由入口构造一次）：它此前是组件 ref，切换会话会把「已提醒 / 冷却中」
+      //    一起丢掉 —— 冷却窗口被重置后，30 分钟内跨几次会话就可能补出几张
+      //    重复的卡，与文档承诺的「全局一个 30 分钟窗口」不符。提醒显示在
+      //    root 作用域的浮层上（账号级事件），状态机也该有同样的生命周期。
+      //
       //    这三步都在 `.then()` 里执行，任何一处抛出都会被下面的 `.catch()`
       //    当成「读取失败」，把一次成功的读数显示成失败。因此这里逐项做了
-      //    存在性检查：附属能力缺失不该污染主读数。
+      //    存在性检查：附属能力缺失不该污染主读数。惰性初始化让测试替身
+      //    （没有预建该字段的服务对象）也能照常工作。
       if (service.alerts !== undefined && service.alerts !== null) {
+        const alertState = service.balanceAlertState ?? (service.balanceAlertState = createAlertState())
         const outcome = advanceAlert(
-          alertState.current,
+          alertState,
           {
             level: model.level,
             amount: model.primary,
@@ -253,7 +278,9 @@ function useBalance(service, sessionId, open) {
           },
           { muted: current.alertOnCross !== true }
         )
-        alertState.current = outcome.state
+        // `advanceAlert` 是纯函数：新状态必须显式写回，状态机才会记住
+        // 「已提醒过哪个档位 / 冷却从何时起算」。
+        service.balanceAlertState = outcome.state
         if (outcome.alert !== null) service.alerts.set(outcome.alert)
       }
     },
@@ -394,17 +421,20 @@ function useBalance(service, sessionId, open) {
       }),
       // 「近 7 天已用」：与「本周」互补 —— 周一只含一天时，这一行给出跨周的
       // 完整 7 天窗口；窗口按当前口径与币种过滤，不会把充值算成消耗。
+      // v0.2.0 起结果带 `dailyAverage`（覆盖天数的日均），词条里一起给出。
       recent: spendInWindow(samples, now, {
         windowMs: RECENT_WINDOW_MS,
+        basis: model?.format,
+        currency: model?.summary?.currency ?? undefined
+      }),
+      // 「最近充值」（v0.2.0）：历史里最近一次**上升**就是入账；与消耗统计同一条
+      // 纪律 —— 同口径、同币种。没有可识别的入账时为 null，该行不渲染。
+      lastTopUp: lastTopUpFromSamples(samples, {
         basis: model?.format,
         currency: model?.summary?.currency ?? undefined
       })
     })
   }, [snap.model, sessionId, snap.model?.format])
-
-  const dismissAlert = React.useCallback(() => {
-    service.alerts.set(null)
-  }, [service])
 
   return {
     model: snap.model,
@@ -480,6 +510,18 @@ function usePanelPosition(rootRef, open) {
 /** 数字格式化的公共参数。 */
 function numberOptions(locale) {
   return { locale, digits: 2 }
+}
+
+/**
+ * 阈值的展示文本：币种符号 + 阈值数字（整数不带小数）。
+ *
+ * v0.3.0 修：面板底部的规则行此前把「¥」写死在词条模板里，账号是美元钱包时
+ * 会显示「低于 ¥3 显示红色」—— 而阈值比较的是**当前展示币种**的金额，
+ * 美元余额对 ¥3 判红是错的。符号现在跟随当前钱包的币种；没有 summary
+ * （尚未读到任何数据）时不带符号，只给数字。
+ */
+function thresholdText(value, currency, locale) {
+  return `${currencySymbol(currency)}${formatThreshold(value, numberOptions(locale))}`
 }
 
 /** 徽章上的金额文本。 */
@@ -765,11 +807,12 @@ function tariffBlocks(props) {
  * 展开面板。
  *
  * 纯展示组件：内部一个 hook 都不用 —— 它会被测试里的微型运行时就地展开，
- * 带钩子就会搅乱根组件的钩子游标。
+ * 带钩子就会搅乱根组件的钩子游标。v0.3.0 起显式导出：单测直接渲染它，
+ * 断言「余额跑道」等条件行的出现与缺席。
  *
  * @param props - `{model, settings, locale, t, busy, onRefresh, position, panelRef, derived, pricing}`。
  */
-function BalancePanel(props) {
+export function BalancePanel(props) {
   const { model, settings, locale, t, busy, onRefresh, position, panelRef, derived, pricing } = props
   const options = numberOptions(locale)
   const summary = model?.summary ?? null
@@ -777,6 +820,7 @@ function BalancePanel(props) {
   const today = derived?.today ?? null
   const week = derived?.week ?? null
   const recent = derived?.recent ?? null
+  const lastTopUp = derived?.lastTopUp ?? null
   const trend = derived?.trend ?? null
   const children = [
     React.createElement(
@@ -894,6 +938,8 @@ function BalancePanel(props) {
 
     // 近 7 天已用（v0.1.6）：与「本周」互补。周一只含一天时，这一行仍然给出
     // 跨周的完整 7 天窗口；样本不足两个时不渲染。
+    // v0.2.0 起附带**日均**：分母是覆盖天数（不足一天算一天），刚装插件的那两小时
+    // 不会被摊薄成「几乎没花」。
     if (recent !== null && recent.spent > 0) {
       children.push(
         React.createElement(
@@ -901,7 +947,45 @@ function BalancePanel(props) {
           { className: 'dbp_recent', key: 'recent', 'data-balance-recent-spend': true },
           t('panel.recentSpend', {
             amount: formatMoney(recent.spent, recent.currency, options),
+            daily: formatMoney(recent.dailyAverage, recent.currency, options),
             time: formatBillingMoment(recent.firstAt, Date.now())
+          })
+        )
+      )
+    }
+
+    // 余额跑道（v0.3.0）：瞬时速度回答「现在烧钱能撑多久」，这一行回答
+    // 「不跑任务的话这点钱能撑几天」—— 用近 7 天日均除当前余额。跟随
+    // `showRate`（用户关掉「显示消耗速度」就是不想看这类预测）；超出
+    // `RUNWAY_MAX_DAYS` 天的跑道没有行动价值，不渲染（与「约 … 耗尽」
+    // 只看 24 小时内是同一条纪律）。
+    if (settings.showRate === true && recent !== null && model !== null) {
+      const runway = runwayOf(model.primary, recent.dailyAverage)
+      if (runway !== null) {
+        children.push(
+          React.createElement(
+            'p',
+            { className: 'dbp_runway', key: 'runway', 'data-balance-runway': true },
+            t('panel.runway', {
+              daily: formatMoney(recent.dailyAverage, recent.currency, options),
+              duration: formatDuration(runway * 86400000, t)
+            })
+          )
+        )
+      }
+    }
+
+    // 最近充值（v0.2.0）：历史里最近一次入账。「充的钱到账没有」是充值后第一个
+    // 想确认的问题，此前要展开网页端才能看；这一行只读历史采样，不新增存储。
+    // 没有可识别的入账（新装、或窗口内只跌不涨）时不渲染。
+    if (lastTopUp !== null && lastTopUp.amount > 0) {
+      children.push(
+        React.createElement(
+          'p',
+          { className: 'dbp_topup', key: 'topup', 'data-balance-last-topup': true },
+          t('panel.lastTopUp', {
+            amount: formatMoneyDelta(lastTopUp.amount, lastTopUp.currency, options),
+            time: formatBillingMoment(lastTopUp.at, Date.now())
           })
         )
       )
@@ -923,6 +1007,10 @@ function BalancePanel(props) {
       // v1.5：标注这是按**当前**时段单价折算的速度。
       // 跨峰/谷切换时这个数会跳，不标注会让用户以为是余额算错了。
       const rateKey = pricing !== null && pricing.isPeak === false ? 'panel.rateOffPeak' : 'panel.rate'
+      // v0.2.0：预计耗尽时刻（24 小时内）直接写进面板。徽章 title 里早有这句话，
+      // 但「今天就会用完」这种事不该要求用户去悬停徽章才能看到。
+      // runoutOf 与徽章 title 用的是同一个函数，两处说法永远一致。
+      const runout = runoutOf(model, settings)
       children.push(
         React.createElement(
           'p',
@@ -930,7 +1018,14 @@ function BalancePanel(props) {
           t(rateKey, {
             amount: formatMoneyDelta(-model.rate.spent, summary.currency, options),
             remaining: formatDuration(hours, t)
-          })
+          }),
+          runout === null
+            ? null
+            : React.createElement(
+                'span',
+                { className: 'dbp_runout', 'data-balance-rate-runout': true },
+                t('panel.runoutAt', { time: formatBeijingDateTime(runout.at) })
+              )
         )
       )
     }
@@ -972,7 +1067,12 @@ function BalancePanel(props) {
     React.createElement(
       'p',
       { className: 'dbp_meta', key: 'rule-text' },
-      t('panel.rule', { low: formatThreshold(settings.low), warn: formatThreshold(settings.warn) })
+      // v0.3.0 起阈值行带上**当前钱包币种**的符号（词条不再写死 ¥）：
+      // 阈值比较的是展示币种的金额，美元账号此前会看到「低于 ¥3 显示红色」。
+      t('panel.rule', {
+        low: thresholdText(settings.low, summary?.currency ?? '', locale),
+        warn: thresholdText(settings.warn, summary?.currency ?? '', locale)
+      })
     ),
     React.createElement('p', { className: 'dbp_meta', key: 'settings-hint' }, t('panel.settingsHint'))
   )

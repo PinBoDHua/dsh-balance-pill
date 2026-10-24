@@ -10,4 +10,4 @@
  * 它必须与 `package.json` 一致，改版本时不能只改一处。
  */
 
-export const PLUGIN_VERSION = '0.1.6'
+export const PLUGIN_VERSION = '0.3.0'

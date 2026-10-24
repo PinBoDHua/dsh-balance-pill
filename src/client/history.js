@@ -27,6 +27,17 @@ export const MAX_AGE_MS = 7 * 24 * 3600 * 1000
 export const MIN_SAMPLE_GAP_MS = 60000
 
 /**
+ * 允许的时钟前偏误差：样本时刻最多允许落在「现在」之后 5 分钟。
+ *
+ * v0.3.0 新增。历史的输入不可全信：外部存储可以被写坏，系统时钟也可能被回拨
+ * （NTP 校时、手动改表、双系统时间漂移）。一枚**落在未来**的样本会排在序列末尾，
+ * 让折线在「现在」之后多出一段、让下一次追加因 `parsed.at - last.at < 0` 永远
+ * 走进「替换最后一枚」的分支（历史从此不再前进）。留 5 分钟余量是给「写样本的
+ * 机器」与「读样本的机器」时钟不一致的情形，超过它的只可能是坏数据。
+ */
+export const FUTURE_SKEW_MS = 5 * 60000
+
+/**
  * 「近 7 天已用」的统计窗口。
  *
  * 与 `MAX_AGE_MS` 相同不是巧合：历史本身就只保留 7 天，窗口再长也只能看到
@@ -34,6 +45,14 @@ export const MIN_SAMPLE_GAP_MS = 60000
  * 概念 —— 将来若延长保留期，窗口仍可以独立决定。
  */
 export const RECENT_WINDOW_MS = 7 * 24 * 3600 * 1000
+
+/**
+ * 「余额跑道」（`runwayOf`）的最大展示窗口：30 天。
+ *
+ * 与耗尽预估只看 24 小时内是同一条纪律——预测只在有行动价值时出现；
+ * 「还能用三个月」不值得占面板一行。
+ */
+export const RUNWAY_MAX_DAYS = 30
 
 /**
  * 解析一枚样本；非法返回 null。
@@ -72,6 +91,8 @@ export function normalizeHistory(raw, now = Date.now()) {
     const sample = parseSample(entry)
     if (sample === null) continue
     if (now - sample.at > MAX_AGE_MS) continue
+    // 未来时刻的样本只可能是坏数据（时钟回拨 / 存储写坏），见 FUTURE_SKEW_MS。
+    if (sample.at > now + FUTURE_SKEW_MS) continue
     samples.push(sample)
   }
   samples.sort((a, b) => a.at - b.at)
@@ -104,6 +125,9 @@ export function normalizeHistory(raw, now = Date.now()) {
 export function appendSample(samples, sample, now = Date.now()) {
   const parsed = parseSample(sample)
   if (parsed === null) return samples
+  // 未来时刻的新样本直接拒绝：normalizeHistory 只清**已有**的历史，写坏的时刻
+  // 若从这里溜进去，会一直排在序列末尾（见 FUTURE_SKEW_MS 的说明）。
+  if (parsed.at > now + FUTURE_SKEW_MS) return samples
   // `now - MAX_AGE_MS` 之外的老样本在这里就丢掉：normalizeHistory 只在**加载**时
   // 裁剪一次，而一个开着一周的会话会一直往数组里追加 —— 不做这一步，内存与
   // localStorage 里会攒下远超 7 天的样本（写入的 JSON 也会越来越大）。
@@ -453,7 +477,92 @@ export function spendInWindow(samples, at, options) {
   if (atMs === null) return null
   const rawWindow = options?.windowMs === undefined ? RECENT_WINDOW_MS : epochOf(options.windowMs)
   if (rawWindow === null || rawWindow <= 0) return null
-  return spendOver(samples, at, options, (sampleAt) => sampleAt >= atMs - rawWindow && sampleAt <= atMs)
+  const result = spendOver(samples, at, options, (sampleAt) => sampleAt >= atMs - rawWindow && sampleAt <= atMs)
+  if (result === null) return null
+  // 日均消耗（v0.2.0）：分母是**覆盖天数**而不是固定 7 —— 窗口里只有两小时样本时，
+  // 除以 7 会把日均压低 84%，读者会以为「其实花得不多」。覆盖不足一天按一天算。
+  const DAY_MS = 86400000
+  const coveredDays = Math.max(1, Math.ceil((result.lastAt - result.firstAt) / DAY_MS))
+  return { ...result, dailyAverage: result.spent / coveredDays }
+}
+
+/**
+ * 从历史里找出**最近一次入账**（充值 / 赠金到账）。
+ *
+ * v0.2.0 新增：`spentFromSamples` 把「下降」记成消耗，对称地，「上升」就是入账。
+ * 面板据此显示「最近充值 +¥20.00（10-22 14:03）」—— 用户充完值最想确认的就是
+ * 「到账了没有、到的是多少」，这一行不需要新增任何存储，只是把历史里已有的
+ * 那一跳读出来。
+ *
+ * 与消耗统计同一条纪律：只认**同口径 + 同币种**的相邻样本（口径切换或币种切换
+ * 造成的跳变不是充值），输入先排序去重再扫描；`at` 是入账那一跳**之后**的样本
+ * 时刻（充值是在两次采样之间发生的，能看到的最早时刻就是后一枚样本）。
+ *
+ * @param samples - 历史样本（顺序不限，函数内会排序）。
+ * @param options - `{basis, currency}`；语义与 `spendInDay` 等相同，都可缺省。
+ * @returns `{amount, at, currency}`（`amount` 恒为正）；没有可识别的入账时
+ *   返回 null。**绝不抛错。**
+ */
+export function lastTopUpFromSamples(samples, options) {
+  if (!Array.isArray(samples)) return null
+  const basis = options?.basis
+  const currency = typeof options?.currency === 'string' && options.currency !== '' ? options.currency : null
+
+  const picked = []
+  for (const sample of samples) {
+    if (sample === null || typeof sample !== 'object') continue
+    const sampleAt = epochOf(sample.at)
+    const amount = typeof sample.amount === 'number' ? sample.amount : NaN
+    if (sampleAt === null || !Number.isFinite(amount)) continue
+    if (typeof basis === 'string' && basis !== '' && sample.basis !== basis) continue
+    if (currency !== null && sample.currency !== currency) continue
+    picked.push({ at: sampleAt, amount, currency: typeof sample.currency === 'string' ? sample.currency : '' })
+  }
+  if (picked.length < 2) return null
+
+  picked.sort((a, b) => a.at - b.at)
+  const ordered = []
+  for (const sample of picked) {
+    const last = ordered[ordered.length - 1]
+    if (last !== undefined && last.at === sample.at) ordered[ordered.length - 1] = sample
+    else ordered.push(sample)
+  }
+
+  let topUp = null
+  for (let index = 1; index < ordered.length; index += 1) {
+    const rise = ordered[index].amount - ordered[index - 1].amount
+    if (rise > 0) topUp = { amount: rise, at: ordered[index].at, currency: ordered[index].currency }
+  }
+  return topUp
+}
+
+/**
+ * 按日均消耗估算「余额还能撑多少天」（面板「余额跑道」行，v0.3.0）。
+ *
+ * 动机：「按当前速度约可用 X」依赖**瞬时**消耗速度，只在账号正在烧钱时存在；
+ * 而用户 idle 时最想问的恰是「这点钱不跑任务能撑几天」。近 7 天日均
+ * （`spendInWindow().dailyAverage`）是已有的统计，除一下就是跑道：
+ *
+ * ```
+ * 余额 ¥19.10，日均 ¥1.91 → 约 10 天
+ * ```
+ *
+ * 展示窗口刻意封顶在 `RUNWAY_MAX_DAYS` 天：更远的跑道没有行动价值，
+ * 天天挂一句「还能用 300 天」只是噪音 —— 与「耗尽预估只看 24 小时内」
+ * 是同一条纪律（预测只在值得行动时才出现）。
+ *
+ * @param balance - 当前余额（当前口径的展示金额）。
+ * @param dailyAverage - 近 7 天日均消耗；来自 `spendInWindow().dailyAverage`。
+ * @returns 天数（可能带小数）；任一输入非法 / 非正，或超出展示窗口时返回 null。
+ *   **绝不抛错。**
+ */
+export function runwayOf(balance, dailyAverage) {
+  const amount = typeof balance === 'number' && Number.isFinite(balance) ? balance : null
+  const average = typeof dailyAverage === 'number' && Number.isFinite(dailyAverage) ? dailyAverage : null
+  if (amount === null || average === null || amount <= 0 || average <= 0) return null
+  const days = amount / average
+  if (days > RUNWAY_MAX_DAYS) return null
+  return days
 }
 
 /** 历史存储的读写：任何异常都静默降级成空历史。 */

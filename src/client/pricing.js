@@ -298,11 +298,22 @@ const DEFAULT_BACK_DAYS = 30
  *    退回当天日界，把整段免费时长截短。
  * 中国法定节假日最长是 9 天（春节），所以两个方向都取 30 天有余量。
  *
+ * ## v0.2.0：单槽缓存
+ * `pricingSnapshot` 一次要查 5 个边界问题（下一次切换、下一个高峰、下一个空闲、
+ * 完整空闲区间的两端），每次都会走到这里 —— 也就是**同一份 61 天 × 每天 2 个
+ * classifyDay 的候选表被重复生成了 5 次**；面板展开时快照跟着秒级心跳走，
+ * 这 5 次重复就发生在每一秒里。候选只由「基准日 + 时区 + 跨度 + 日历」决定，
+ * 同一个计费日内结果逐毫秒不变，因此按这些维度做单槽缓存：同一天内的后续 4 次
+ * 调用直接命中。**自定义日历（`options.holidays`）不缓存**：两张不同的自定义表
+ * 在缓存键里区分不开，宁可慢也不能错。返回数组只读，调用方不修改它。
+ *
  * @param at - 参照时刻。
  * @param tzOffsetMinutes - 计费时区偏移。
  * @param options - 同 `periodAt`，外加 `days` / `backDays` 覆盖跨度。
  * @returns 升序去重的边界数组。
  */
+let boundaryCandidatesCache = null
+
 function boundaryCandidates(at, tzOffsetMinutes, options) {
   const days = Number.isFinite(Number(options?.days)) && Number(options.days) > 0
     ? Math.floor(Number(options.days))
@@ -311,6 +322,11 @@ function boundaryCandidates(at, tzOffsetMinutes, options) {
     ? Math.floor(Number(options.backDays))
     : DEFAULT_BACK_DAYS
   const base = epochDayOf(at, tzOffsetMinutes)
+  const customCalendar = options?.holidays !== undefined && options?.holidays !== null
+  const cacheKey = customCalendar
+    ? null
+    : `${base}|${tzOffsetMinutes}|${days}|${backDays}|${options?.useCalendar === false ? 'off' : 'on'}`
+  if (cacheKey !== null && boundaryCandidatesCache?.key === cacheKey) return boundaryCandidatesCache.value
   const out = []
   for (let offset = -backDays; offset <= days; offset += 1) {
     const dayStart = dayStartMs(base + offset, tzOffsetMinutes)
@@ -320,7 +336,9 @@ function boundaryCandidates(at, tzOffsetMinutes, options) {
       out.push(window.end)
     }
   }
-  return [...new Set(out)].sort((a, b) => a - b)
+  const value = [...new Set(out)].sort((a, b) => a - b)
+  if (cacheKey !== null) boundaryCandidatesCache = { key: cacheKey, value }
+  return value
 }
 
 /**

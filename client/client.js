@@ -463,11 +463,22 @@ const DEFAULT_BACK_DAYS = 30
  *    退回当天日界，把整段免费时长截短。
  * 中国法定节假日最长是 9 天（春节），所以两个方向都取 30 天有余量。
  *
+ * ## v0.2.0：单槽缓存
+ * `pricingSnapshot` 一次要查 5 个边界问题（下一次切换、下一个高峰、下一个空闲、
+ * 完整空闲区间的两端），每次都会走到这里 —— 也就是**同一份 61 天 × 每天 2 个
+ * classifyDay 的候选表被重复生成了 5 次**；面板展开时快照跟着秒级心跳走，
+ * 这 5 次重复就发生在每一秒里。候选只由「基准日 + 时区 + 跨度 + 日历」决定，
+ * 同一个计费日内结果逐毫秒不变，因此按这些维度做单槽缓存：同一天内的后续 4 次
+ * 调用直接命中。**自定义日历（`options.holidays`）不缓存**：两张不同的自定义表
+ * 在缓存键里区分不开，宁可慢也不能错。返回数组只读，调用方不修改它。
+ *
  * @param at - 参照时刻。
  * @param tzOffsetMinutes - 计费时区偏移。
  * @param options - 同 `periodAt`，外加 `days` / `backDays` 覆盖跨度。
  * @returns 升序去重的边界数组。
  */
+let boundaryCandidatesCache = null
+
 function boundaryCandidates(at, tzOffsetMinutes, options) {
   const days = Number.isFinite(Number(options?.days)) && Number(options.days) > 0
     ? Math.floor(Number(options.days))
@@ -476,6 +487,11 @@ function boundaryCandidates(at, tzOffsetMinutes, options) {
     ? Math.floor(Number(options.backDays))
     : DEFAULT_BACK_DAYS
   const base = epochDayOf(at, tzOffsetMinutes)
+  const customCalendar = options?.holidays !== undefined && options?.holidays !== null
+  const cacheKey = customCalendar
+    ? null
+    : `${base}|${tzOffsetMinutes}|${days}|${backDays}|${options?.useCalendar === false ? 'off' : 'on'}`
+  if (cacheKey !== null && boundaryCandidatesCache?.key === cacheKey) return boundaryCandidatesCache.value
   const out = []
   for (let offset = -backDays; offset <= days; offset += 1) {
     const dayStart = dayStartMs(base + offset, tzOffsetMinutes)
@@ -485,7 +501,9 @@ function boundaryCandidates(at, tzOffsetMinutes, options) {
       out.push(window.end)
     }
   }
-  return [...new Set(out)].sort((a, b) => a - b)
+  const value = [...new Set(out)].sort((a, b) => a - b)
+  if (cacheKey !== null) boundaryCandidatesCache = { key: cacheKey, value }
+  return value
 }
 
 /**
@@ -829,6 +847,25 @@ const POLL_CHOICES = [0, 30000, 60000, 300000]
 /** 轮询间隔默认值：60 秒。 */
 const DEFAULT_POLL_MS = 60000
 
+/**
+ * 刷新间隔下拉的完整选项列表（毫秒，升序）。
+ *
+ * 存储里的 `pollMs` 允许是任意 ≥5000 的值（`normalizePoll` 只把过密的抬到 5000，
+ * 并不对齐档位），因此它不一定落在 `POLL_CHOICES` 里 —— 而受控 `<select>` 的
+ * value 匹配不到任何 option 时会渲染成**空白**，用户会看到「刷新间隔什么都没选」。
+ * v0.3.0 起把当前值动态并进选项（排在排序正确的位置），存储里存过
+ * `15000` 这类自定义值的界面不再开天窗。
+ *
+ * @param currentMs - 当前配置里的轮询间隔。
+ * @returns 毫秒数组（升序，含 `currentMs`）。
+ */
+function pollChoiceList(currentMs) {
+  const list = [...POLL_CHOICES]
+  const value = typeof currentMs === 'number' && Number.isFinite(currentMs) ? Math.round(currentMs) : null
+  if (value !== null && !list.includes(value)) list.push(value)
+  return list.sort((a, b) => a - b)
+}
+
 /** 距离上次读取多久之内不再重复请求（手动刷新与自动刷新共用）。 */
 const MIN_REFRESH_GAP_MS = 10000
 
@@ -1098,7 +1135,7 @@ function createSettingsStore(initial, storage = defaultStorage()) {
  * `x-client-*` 请求头（`@deepseek-ai/dsh-deepseek-account` 的
  * platformClientHeaders），它只用于平台侧统计界面来源，不参与鉴权。
  */
-const CLIENT_VERSION = '0.2.0-rc.2'
+const CLIENT_VERSION = '0.2.1'
 
 /** 目标语言键 → 平台需要的 locale 前缀。 */
 function platformLocale(active) {
@@ -2040,7 +2077,14 @@ function formatPeakWindow(window, tzOffsetMinutes, t) {
  * @param t - 本地化函数。
  */
 function formatCountdown(ms, t) {
-  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return t('duration.unknown')
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return t('duration.unknown')
+  // v0.2.0：恰好为 0 不再显示「暂时无法估算」。`msUntil*` 都是 `Math.max(0, …)`，
+  // 边界的那一拍会得到 0 —— 旧实现把它与 NaN 一起归进 unknown，于是倒计时在
+  // 跨过边界的前后各有一拍闪出「暂时无法估算」，看起来像算崩了。
+  // 0 意味着「就在此刻」，按剩余 1 秒显示最接近读者的直觉；负数仍视为不可估算
+  // （那不是倒计时，是调用方传错了）。
+  if (ms === 0) return t('duration.seconds', { count: 1 })
+  if (ms < 0) return t('duration.unknown')
   const totalMinutes = Math.floor(ms / 60000)
   if (totalMinutes < 1) return t('duration.seconds', { count: Math.max(1, Math.round(ms / 1000)) })
   const days = Math.floor(totalMinutes / 1440)
@@ -2347,13 +2391,18 @@ const zh = {
   'panel.updated': '更新于 {time}（{age}）',
   'panel.auto': '每 {seconds} 秒自动刷新',
   'panel.manual': '仅手动刷新与窗口聚焦时读取',
-  'panel.rule': '低于 ¥{low} 显示红色 · 低于 ¥{warn} 显示橙色',
+  // v0.3.0 起阈值不带写死的 ¥：阈值比较的是**当前展示币种**的金额，符号由
+  // 组件按当前钱包币种给出（没有读数时不带符号）。两版模板占位符必须一致。
+  'panel.rule': '低于 {low} 显示红色 · 低于 {warn} 显示橙色',
   'panel.rate': '近期消耗 {amount}，按此速度约可用 {remaining}',
   'panel.rateOffPeak': '近期消耗 {amount}（空闲价），按此速度约可用 {remaining}',
   'panel.sessionSpend': '本轮会话已用 {amount}（自 {time} 起）',
   'panel.todaySpend': '今日已用 {amount}（自 {time} 起）',
   'panel.weekSpend': '本周已用 {amount}（自 {time} 起）',
-  'panel.recentSpend': '近 7 天已用 {amount}（自 {time} 起）',
+  'panel.recentSpend': '近 7 天已用 {amount}（日均 {daily}，自 {time} 起）',
+  'panel.runway': '按日均 {daily} 估算，余额约可支撑 {duration}',
+  'panel.lastTopUp': '最近充值 {amount}（{time}）',
+  'panel.runoutAt': '，约 {time} 耗尽',
   'panel.trend.aria': '余额趋势：{points} 个采样点，从 {from} 到 {to}',
   'panel.others': '其他币种：{list}',
   'panel.stale': '⚠ 本次刷新失败，上面显示的是 {age}的数据',
@@ -2401,7 +2450,7 @@ const zh = {
   'settings.currency.CNY': '人民币 ¥',
   'settings.currency.USD': '美元 $',
   'settings.thresholds.title': '预警档位',
-  'settings.thresholds.description': '当前：低于 ¥{low} 红色，低于 ¥{warn} 橙色。填入金额后立即生效。',
+  'settings.thresholds.description': '当前：红色阈值 {low}，橙色阈值 {warn}。填入金额后立即生效。',
   'settings.low': '红色阈值',
   'settings.warn': '橙色阈值',
   'settings.poll.title': '刷新间隔',
@@ -2453,7 +2502,7 @@ const zh = {
   'settings.tariffModel.title': '价格口径',
   'settings.tariffModel.description': '面板里的价格与预估按哪个模型计算。',
   'settings.alertOnTariff.title': '时段切换提醒',
-  'settings.alertOnTariff.description': '高峰开始与空闲时段开始时浮出一张提示卡，每小时最多一张。',
+  'settings.alertOnTariff.description': '高峰开始与空闲时段开始时浮出一张提示卡，每个方向每小时最多一张。',
 
   'alert.tariff.peak.title': '进入高峰时段',
   'alert.tariff.peak.body': '单价已翻倍（{model} 输出 ¥{output}/百万 tokens）。不急的活可以留到 {time} 之后。',
@@ -2485,13 +2534,16 @@ const en = {
   'panel.updated': 'Updated {time} ({age})',
   'panel.auto': 'Auto-refreshes every {seconds}s',
   'panel.manual': 'Reads only on manual refresh and window focus',
-  'panel.rule': 'Red below ¥{low} · amber below ¥{warn}',
+  'panel.rule': 'Red below {low} · amber below {warn}',
   'panel.rate': 'Recent burn {amount}; about {remaining} left at this pace',
   'panel.rateOffPeak': 'Recent burn {amount} (off-peak rate); about {remaining} left at this pace',
   'panel.sessionSpend': 'This conversation has used {amount} (since {time})',
   'panel.todaySpend': 'Used today {amount} (since {time})',
   'panel.weekSpend': 'Used this week {amount} (since {time})',
-  'panel.recentSpend': 'Used in the last 7 days {amount} (since {time})',
+  'panel.recentSpend': 'Used in the last 7 days {amount} ({daily}/day, since {time})',
+  'panel.runway': 'At {daily}/day, the balance lasts about {duration}',
+  'panel.lastTopUp': 'Last top-up {amount} ({time})',
+  'panel.runoutAt': ', runs out around {time}',
   'panel.trend.aria': 'Balance trend: {points} samples, from {from} to {to}',
   'panel.others': 'Other currencies: {list}',
   'panel.stale': '⚠ This refresh failed; the figures above are from {age}',
@@ -2539,7 +2591,7 @@ const en = {
   'settings.currency.CNY': 'CNY ¥',
   'settings.currency.USD': 'USD $',
   'settings.thresholds.title': 'Warning thresholds',
-  'settings.thresholds.description': 'Now: red below ¥{low}, amber below ¥{warn}. Changes apply immediately.',
+  'settings.thresholds.description': 'Now: red at {low}, amber at {warn}. Changes apply immediately.',
   'settings.low': 'Red threshold',
   'settings.warn': 'Amber threshold',
   'settings.poll.title': 'Refresh interval',
@@ -2591,7 +2643,7 @@ const en = {
   'settings.tariffModel.title': 'Rate table',
   'settings.tariffModel.description': 'Which model the panel prices and estimates use.',
   'settings.alertOnTariff.title': 'Billing-window alerts',
-  'settings.alertOnTariff.description': 'Raises a card when peak starts and when off-peak starts, at most one card per hour.',
+  'settings.alertOnTariff.description': 'Raises a card when peak starts and when off-peak starts, at most one card per hour per direction.',
 
   'alert.tariff.peak.title': 'Peak hours started',
   'alert.tariff.peak.body': 'Rates doubled ({model} output ¥{output}/M tokens). Non-urgent work can wait until {time}.',
@@ -2632,6 +2684,17 @@ const MAX_AGE_MS = 7 * 24 * 3600 * 1000
 const MIN_SAMPLE_GAP_MS = 60000
 
 /**
+ * 允许的时钟前偏误差：样本时刻最多允许落在「现在」之后 5 分钟。
+ *
+ * v0.3.0 新增。历史的输入不可全信：外部存储可以被写坏，系统时钟也可能被回拨
+ * （NTP 校时、手动改表、双系统时间漂移）。一枚**落在未来**的样本会排在序列末尾，
+ * 让折线在「现在」之后多出一段、让下一次追加因 `parsed.at - last.at < 0` 永远
+ * 走进「替换最后一枚」的分支（历史从此不再前进）。留 5 分钟余量是给「写样本的
+ * 机器」与「读样本的机器」时钟不一致的情形，超过它的只可能是坏数据。
+ */
+const FUTURE_SKEW_MS = 5 * 60000
+
+/**
  * 「近 7 天已用」的统计窗口。
  *
  * 与 `MAX_AGE_MS` 相同不是巧合：历史本身就只保留 7 天，窗口再长也只能看到
@@ -2639,6 +2702,14 @@ const MIN_SAMPLE_GAP_MS = 60000
  * 概念 —— 将来若延长保留期，窗口仍可以独立决定。
  */
 const RECENT_WINDOW_MS = 7 * 24 * 3600 * 1000
+
+/**
+ * 「余额跑道」（`runwayOf`）的最大展示窗口：30 天。
+ *
+ * 与耗尽预估只看 24 小时内是同一条纪律——预测只在有行动价值时出现；
+ * 「还能用三个月」不值得占面板一行。
+ */
+const RUNWAY_MAX_DAYS = 30
 
 /**
  * 解析一枚样本；非法返回 null。
@@ -2677,6 +2748,8 @@ function normalizeHistory(raw, now = Date.now()) {
     const sample = parseSample(entry)
     if (sample === null) continue
     if (now - sample.at > MAX_AGE_MS) continue
+    // 未来时刻的样本只可能是坏数据（时钟回拨 / 存储写坏），见 FUTURE_SKEW_MS。
+    if (sample.at > now + FUTURE_SKEW_MS) continue
     samples.push(sample)
   }
   samples.sort((a, b) => a.at - b.at)
@@ -2709,6 +2782,9 @@ function normalizeHistory(raw, now = Date.now()) {
 function appendSample(samples, sample, now = Date.now()) {
   const parsed = parseSample(sample)
   if (parsed === null) return samples
+  // 未来时刻的新样本直接拒绝：normalizeHistory 只清**已有**的历史，写坏的时刻
+  // 若从这里溜进去，会一直排在序列末尾（见 FUTURE_SKEW_MS 的说明）。
+  if (parsed.at > now + FUTURE_SKEW_MS) return samples
   // `now - MAX_AGE_MS` 之外的老样本在这里就丢掉：normalizeHistory 只在**加载**时
   // 裁剪一次，而一个开着一周的会话会一直往数组里追加 —— 不做这一步，内存与
   // localStorage 里会攒下远超 7 天的样本（写入的 JSON 也会越来越大）。
@@ -3058,7 +3134,92 @@ function spendInWindow(samples, at, options) {
   if (atMs === null) return null
   const rawWindow = options?.windowMs === undefined ? RECENT_WINDOW_MS : epochOf(options.windowMs)
   if (rawWindow === null || rawWindow <= 0) return null
-  return spendOver(samples, at, options, (sampleAt) => sampleAt >= atMs - rawWindow && sampleAt <= atMs)
+  const result = spendOver(samples, at, options, (sampleAt) => sampleAt >= atMs - rawWindow && sampleAt <= atMs)
+  if (result === null) return null
+  // 日均消耗（v0.2.0）：分母是**覆盖天数**而不是固定 7 —— 窗口里只有两小时样本时，
+  // 除以 7 会把日均压低 84%，读者会以为「其实花得不多」。覆盖不足一天按一天算。
+  const DAY_MS = 86400000
+  const coveredDays = Math.max(1, Math.ceil((result.lastAt - result.firstAt) / DAY_MS))
+  return { ...result, dailyAverage: result.spent / coveredDays }
+}
+
+/**
+ * 从历史里找出**最近一次入账**（充值 / 赠金到账）。
+ *
+ * v0.2.0 新增：`spentFromSamples` 把「下降」记成消耗，对称地，「上升」就是入账。
+ * 面板据此显示「最近充值 +¥20.00（10-22 14:03）」—— 用户充完值最想确认的就是
+ * 「到账了没有、到的是多少」，这一行不需要新增任何存储，只是把历史里已有的
+ * 那一跳读出来。
+ *
+ * 与消耗统计同一条纪律：只认**同口径 + 同币种**的相邻样本（口径切换或币种切换
+ * 造成的跳变不是充值），输入先排序去重再扫描；`at` 是入账那一跳**之后**的样本
+ * 时刻（充值是在两次采样之间发生的，能看到的最早时刻就是后一枚样本）。
+ *
+ * @param samples - 历史样本（顺序不限，函数内会排序）。
+ * @param options - `{basis, currency}`；语义与 `spendInDay` 等相同，都可缺省。
+ * @returns `{amount, at, currency}`（`amount` 恒为正）；没有可识别的入账时
+ *   返回 null。**绝不抛错。**
+ */
+function lastTopUpFromSamples(samples, options) {
+  if (!Array.isArray(samples)) return null
+  const basis = options?.basis
+  const currency = typeof options?.currency === 'string' && options.currency !== '' ? options.currency : null
+
+  const picked = []
+  for (const sample of samples) {
+    if (sample === null || typeof sample !== 'object') continue
+    const sampleAt = epochOf(sample.at)
+    const amount = typeof sample.amount === 'number' ? sample.amount : NaN
+    if (sampleAt === null || !Number.isFinite(amount)) continue
+    if (typeof basis === 'string' && basis !== '' && sample.basis !== basis) continue
+    if (currency !== null && sample.currency !== currency) continue
+    picked.push({ at: sampleAt, amount, currency: typeof sample.currency === 'string' ? sample.currency : '' })
+  }
+  if (picked.length < 2) return null
+
+  picked.sort((a, b) => a.at - b.at)
+  const ordered = []
+  for (const sample of picked) {
+    const last = ordered[ordered.length - 1]
+    if (last !== undefined && last.at === sample.at) ordered[ordered.length - 1] = sample
+    else ordered.push(sample)
+  }
+
+  let topUp = null
+  for (let index = 1; index < ordered.length; index += 1) {
+    const rise = ordered[index].amount - ordered[index - 1].amount
+    if (rise > 0) topUp = { amount: rise, at: ordered[index].at, currency: ordered[index].currency }
+  }
+  return topUp
+}
+
+/**
+ * 按日均消耗估算「余额还能撑多少天」（面板「余额跑道」行，v0.3.0）。
+ *
+ * 动机：「按当前速度约可用 X」依赖**瞬时**消耗速度，只在账号正在烧钱时存在；
+ * 而用户 idle 时最想问的恰是「这点钱不跑任务能撑几天」。近 7 天日均
+ * （`spendInWindow().dailyAverage`）是已有的统计，除一下就是跑道：
+ *
+ * ```
+ * 余额 ¥19.10，日均 ¥1.91 → 约 10 天
+ * ```
+ *
+ * 展示窗口刻意封顶在 `RUNWAY_MAX_DAYS` 天：更远的跑道没有行动价值，
+ * 天天挂一句「还能用 300 天」只是噪音 —— 与「耗尽预估只看 24 小时内」
+ * 是同一条纪律（预测只在值得行动时才出现）。
+ *
+ * @param balance - 当前余额（当前口径的展示金额）。
+ * @param dailyAverage - 近 7 天日均消耗；来自 `spendInWindow().dailyAverage`。
+ * @returns 天数（可能带小数）；任一输入非法 / 非正，或超出展示窗口时返回 null。
+ *   **绝不抛错。**
+ */
+function runwayOf(balance, dailyAverage) {
+  const amount = typeof balance === 'number' && Number.isFinite(balance) ? balance : null
+  const average = typeof dailyAverage === 'number' && Number.isFinite(dailyAverage) ? dailyAverage : null
+  if (amount === null || average === null || amount <= 0 || average <= 0) return null
+  const days = amount / average
+  if (days > RUNWAY_MAX_DAYS) return null
+  return days
 }
 
 /** 历史存储的读写：任何异常都静默降级成空历史。 */
@@ -3082,6 +3243,57 @@ function saveHistory(samples, storage = resolveStorage()) {
   } catch {
     return false
   }
+}
+
+// ---- src/client/readings.js ----------------------------------
+/**
+ * 余额徽章 —— 最近一次成功读数的共享槽位。
+ *
+ * ## 为什么需要它
+ * 会话作用域的徽章与 root 作用域的时段看门狗（见 tariff-service.js）都要用到
+ * 「余额现在是多少」。看门狗没法自己去读账号 —— 那会让同一个 Remote 被两处
+ * 独立轮询，两边的数字还可能相差一个轮询周期 —— 于是让徽章把成功读数写进这个
+ * 极薄的槽位，看门狗读它。
+ *
+ * 它是**只读快照 + 写入端**的共享状态，不参与 React 渲染：没有订阅者，也就不会
+ * 引起额外重渲染。历史（history.js）记录的是采样点序列，而这里是「最后一条」，
+ * 两者用途不同，因此不合并。
+ */
+
+/** 槽位内容：`{amount, currency, at, perHour}`；从未读到过时为 null。 */
+let latest = null
+
+/**
+ * 记录一次成功读数。
+ * @param reading - `{amount, currency, at, perHour}`；`amount` 非法时忽略本次写入。
+ */
+function recordReading(reading) {
+  if (reading === null || reading === undefined) return
+  const amount = Number(reading.amount)
+  if (!Number.isFinite(amount)) return
+  const perHour = Number(reading.perHour)
+  latest = {
+    amount,
+    currency: typeof reading.currency === 'string' ? reading.currency : '',
+    at: Number.isFinite(Number(reading.at)) ? Number(reading.at) : Date.now(),
+    /** 消耗速度（元/小时）；未知或非正数时为 null（与 balance.js 的口径一致）。 */
+    perHour: Number.isFinite(perHour) && perHour > 0 ? perHour : null
+  }
+}
+
+/** 当前槽位内容（只读快照）；从未写入时为 null。 */
+function latestReading() {
+  return latest
+}
+
+/**
+ * 清空槽位。
+ *
+ * 只在单测里用：模块级状态会跨用例泄漏，测试必须能重置它。
+ * 生产代码里余额只会因为「换账号」而失效，而那时下一次轮询会立刻覆盖它。
+ */
+function resetReading() {
+  latest = null
 }
 
 // ---- src/client/session-spend.js -----------------------------
@@ -3390,7 +3602,7 @@ function TrendSparkline(props) {
  * 它必须与 `package.json` 一致，改版本时不能只改一处。
  */
 
-const PLUGIN_VERSION = '0.1.6'
+const PLUGIN_VERSION = '0.3.0'
 
 // ---- src/client/pill.js --------------------------------------
 /**
@@ -3411,6 +3623,10 @@ const PLUGIN_VERSION = '0.1.6'
  * v1.3 增加计费时段（高峰 / 空闲）：徽章上挂一枚时段徽标，面板里补一组时段区块。
  * 时段判定全部来自 `pricing.js`（纯函数），这里只负责「什么时候重算」与「怎么显示」——
  * 面板打开时用秒级心跳重算倒计时，关着时按 30 秒分桶，别让徽章在后台白烧 CPU。
+ *
+ * v0.3.0：跨档提醒的状态机提升为账号级（`service.balanceAlertState`，跨会话存活）；
+ * 面板新增「余额跑道」行（按近 7 天日均估算可用天数）；规则行的阈值带上当前
+ * 钱包币种的符号（词条不再写死 ¥）。`BalancePanel` 显式导出供单测渲染。
  */
 
 
@@ -3418,6 +3634,7 @@ const PLUGIN_VERSION = '0.1.6'
 
 // 只借 `priceOf` 读单价：时段快照一律走 `service.tariff.snapshot()`（见下方
 // useTariffSnapshot），这里不自己拼装时段判定，免得出现两份口径。
+
 
 
 
@@ -3450,15 +3667,14 @@ function useSettingValue(store) {
   return value
 }
 
-/** 币种前缀；紧凑模式返回空串。 */
+/**
+ * 币种前缀；紧凑模式返回空串。
+ *
+ * v0.3.0 起直接复用 `format.js` 的 `currencySymbol`：两处此前各写了一份
+ * 「CNY→¥ / USD→$ / 其他→代码」的映射，改币种展示要同步两处。
+ */
 function currencyPrefix(currency, settings) {
-  if (settings.compact !== true) {
-    if (currency === 'CNY') return '¥'
-    if (currency === 'USD') return '$'
-    if (typeof currency === 'string' && currency !== '') return `${currency} `
-    return ''
-  }
-  return ''
+  return settings.compact === true ? '' : currencySymbol(currency)
 }
 
 /**
@@ -3548,10 +3764,8 @@ function useBalance(service, sessionId, open) {
   const history = React.useRef(null)
   /** 每个会话的基准余额，用于算「本轮花了多少」。 */
   const baselines = React.useRef(null)
-  /** 跨档提醒的状态机。 */
-  const alertState = React.useRef(createAlertState())
   /** 面板打开时才画趋势图，避免无人观看时也做降采样与重渲染。 */
-  const [derived, setDerived] = React.useState({ trend: null, spend: null, today: null, week: null, recent: null })
+  const [derived, setDerived] = React.useState({ trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null })
 
   if (history.current === null) history.current = loadHistory(service.storage)
   if (baselines.current === null) baselines.current = loadBaselines(service.storage)
@@ -3600,6 +3814,18 @@ function useBalance(service, sessionId, open) {
       history.current = appendSample(history.current ?? [], reading)
       saveHistory(history.current, service.storage)
 
+      // 1b) 共享读数槽位（v0.2.0 接线）：`readings.js` 的写入端在 v1.4 建好后
+      //     一直没接上 —— `latestReading()` 恒为 null，`shell.overlay` 上的时段
+      //     看门狗拿到的快照里余额与速度永远是空的，峰谷预估全部静默为 null。
+      //     徽章每次成功读数都把「金额 + 币种 + 时刻 + 速度」写进去，看门狗
+      //     tick 时即可读到与徽章同一口径的最近读数（见 index.js 的 run）。
+      recordReading({
+        at: reading.at,
+        amount: reading.amount,
+        currency: reading.currency,
+        perHour: model.rate?.perHour ?? null
+      })
+
       // 2) 会话基准：本会话第一次看到余额时记下，之后用「当前 - 基准」算本轮消耗。
       baselines.current = recordBaseline(baselines.current ?? {}, sessionId, reading)
       baselines.current = pruneBaselines(baselines.current)
@@ -3609,12 +3835,20 @@ function useBalance(service, sessionId, open) {
       //    提醒写进共享 store（不是组件 state）—— 徽章是会话作用域的，
       //    切换会话会卸载重挂，放在组件里的提醒会被顺手清掉。
       //
+      //    v0.3.0 起状态机本身也提升为**账号级**（`service.balanceAlertState`，
+      //    由入口构造一次）：它此前是组件 ref，切换会话会把「已提醒 / 冷却中」
+      //    一起丢掉 —— 冷却窗口被重置后，30 分钟内跨几次会话就可能补出几张
+      //    重复的卡，与文档承诺的「全局一个 30 分钟窗口」不符。提醒显示在
+      //    root 作用域的浮层上（账号级事件），状态机也该有同样的生命周期。
+      //
       //    这三步都在 `.then()` 里执行，任何一处抛出都会被下面的 `.catch()`
       //    当成「读取失败」，把一次成功的读数显示成失败。因此这里逐项做了
-      //    存在性检查：附属能力缺失不该污染主读数。
+      //    存在性检查：附属能力缺失不该污染主读数。惰性初始化让测试替身
+      //    （没有预建该字段的服务对象）也能照常工作。
       if (service.alerts !== undefined && service.alerts !== null) {
+        const alertState = service.balanceAlertState ?? (service.balanceAlertState = createAlertState())
         const outcome = advanceAlert(
-          alertState.current,
+          alertState,
           {
             level: model.level,
             amount: model.primary,
@@ -3626,7 +3860,9 @@ function useBalance(service, sessionId, open) {
           },
           { muted: current.alertOnCross !== true }
         )
-        alertState.current = outcome.state
+        // `advanceAlert` 是纯函数：新状态必须显式写回，状态机才会记住
+        // 「已提醒过哪个档位 / 冷却从何时起算」。
+        service.balanceAlertState = outcome.state
         if (outcome.alert !== null) service.alerts.set(outcome.alert)
       }
     },
@@ -3767,17 +4003,20 @@ function useBalance(service, sessionId, open) {
       }),
       // 「近 7 天已用」：与「本周」互补 —— 周一只含一天时，这一行给出跨周的
       // 完整 7 天窗口；窗口按当前口径与币种过滤，不会把充值算成消耗。
+      // v0.2.0 起结果带 `dailyAverage`（覆盖天数的日均），词条里一起给出。
       recent: spendInWindow(samples, now, {
         windowMs: RECENT_WINDOW_MS,
+        basis: model?.format,
+        currency: model?.summary?.currency ?? undefined
+      }),
+      // 「最近充值」（v0.2.0）：历史里最近一次**上升**就是入账；与消耗统计同一条
+      // 纪律 —— 同口径、同币种。没有可识别的入账时为 null，该行不渲染。
+      lastTopUp: lastTopUpFromSamples(samples, {
         basis: model?.format,
         currency: model?.summary?.currency ?? undefined
       })
     })
   }, [snap.model, sessionId, snap.model?.format])
-
-  const dismissAlert = React.useCallback(() => {
-    service.alerts.set(null)
-  }, [service])
 
   return {
     model: snap.model,
@@ -3853,6 +4092,18 @@ function usePanelPosition(rootRef, open) {
 /** 数字格式化的公共参数。 */
 function numberOptions(locale) {
   return { locale, digits: 2 }
+}
+
+/**
+ * 阈值的展示文本：币种符号 + 阈值数字（整数不带小数）。
+ *
+ * v0.3.0 修：面板底部的规则行此前把「¥」写死在词条模板里，账号是美元钱包时
+ * 会显示「低于 ¥3 显示红色」—— 而阈值比较的是**当前展示币种**的金额，
+ * 美元余额对 ¥3 判红是错的。符号现在跟随当前钱包的币种；没有 summary
+ * （尚未读到任何数据）时不带符号，只给数字。
+ */
+function thresholdText(value, currency, locale) {
+  return `${currencySymbol(currency)}${formatThreshold(value, numberOptions(locale))}`
 }
 
 /** 徽章上的金额文本。 */
@@ -4138,7 +4389,8 @@ function tariffBlocks(props) {
  * 展开面板。
  *
  * 纯展示组件：内部一个 hook 都不用 —— 它会被测试里的微型运行时就地展开，
- * 带钩子就会搅乱根组件的钩子游标。
+ * 带钩子就会搅乱根组件的钩子游标。v0.3.0 起显式导出：单测直接渲染它，
+ * 断言「余额跑道」等条件行的出现与缺席。
  *
  * @param props - `{model, settings, locale, t, busy, onRefresh, position, panelRef, derived, pricing}`。
  */
@@ -4150,6 +4402,7 @@ function BalancePanel(props) {
   const today = derived?.today ?? null
   const week = derived?.week ?? null
   const recent = derived?.recent ?? null
+  const lastTopUp = derived?.lastTopUp ?? null
   const trend = derived?.trend ?? null
   const children = [
     React.createElement(
@@ -4267,6 +4520,8 @@ function BalancePanel(props) {
 
     // 近 7 天已用（v0.1.6）：与「本周」互补。周一只含一天时，这一行仍然给出
     // 跨周的完整 7 天窗口；样本不足两个时不渲染。
+    // v0.2.0 起附带**日均**：分母是覆盖天数（不足一天算一天），刚装插件的那两小时
+    // 不会被摊薄成「几乎没花」。
     if (recent !== null && recent.spent > 0) {
       children.push(
         React.createElement(
@@ -4274,7 +4529,45 @@ function BalancePanel(props) {
           { className: 'dbp_recent', key: 'recent', 'data-balance-recent-spend': true },
           t('panel.recentSpend', {
             amount: formatMoney(recent.spent, recent.currency, options),
+            daily: formatMoney(recent.dailyAverage, recent.currency, options),
             time: formatBillingMoment(recent.firstAt, Date.now())
+          })
+        )
+      )
+    }
+
+    // 余额跑道（v0.3.0）：瞬时速度回答「现在烧钱能撑多久」，这一行回答
+    // 「不跑任务的话这点钱能撑几天」—— 用近 7 天日均除当前余额。跟随
+    // `showRate`（用户关掉「显示消耗速度」就是不想看这类预测）；超出
+    // `RUNWAY_MAX_DAYS` 天的跑道没有行动价值，不渲染（与「约 … 耗尽」
+    // 只看 24 小时内是同一条纪律）。
+    if (settings.showRate === true && recent !== null && model !== null) {
+      const runway = runwayOf(model.primary, recent.dailyAverage)
+      if (runway !== null) {
+        children.push(
+          React.createElement(
+            'p',
+            { className: 'dbp_runway', key: 'runway', 'data-balance-runway': true },
+            t('panel.runway', {
+              daily: formatMoney(recent.dailyAverage, recent.currency, options),
+              duration: formatDuration(runway * 86400000, t)
+            })
+          )
+        )
+      }
+    }
+
+    // 最近充值（v0.2.0）：历史里最近一次入账。「充的钱到账没有」是充值后第一个
+    // 想确认的问题，此前要展开网页端才能看；这一行只读历史采样，不新增存储。
+    // 没有可识别的入账（新装、或窗口内只跌不涨）时不渲染。
+    if (lastTopUp !== null && lastTopUp.amount > 0) {
+      children.push(
+        React.createElement(
+          'p',
+          { className: 'dbp_topup', key: 'topup', 'data-balance-last-topup': true },
+          t('panel.lastTopUp', {
+            amount: formatMoneyDelta(lastTopUp.amount, lastTopUp.currency, options),
+            time: formatBillingMoment(lastTopUp.at, Date.now())
           })
         )
       )
@@ -4296,6 +4589,10 @@ function BalancePanel(props) {
       // v1.5：标注这是按**当前**时段单价折算的速度。
       // 跨峰/谷切换时这个数会跳，不标注会让用户以为是余额算错了。
       const rateKey = pricing !== null && pricing.isPeak === false ? 'panel.rateOffPeak' : 'panel.rate'
+      // v0.2.0：预计耗尽时刻（24 小时内）直接写进面板。徽章 title 里早有这句话，
+      // 但「今天就会用完」这种事不该要求用户去悬停徽章才能看到。
+      // runoutOf 与徽章 title 用的是同一个函数，两处说法永远一致。
+      const runout = runoutOf(model, settings)
       children.push(
         React.createElement(
           'p',
@@ -4303,7 +4600,14 @@ function BalancePanel(props) {
           t(rateKey, {
             amount: formatMoneyDelta(-model.rate.spent, summary.currency, options),
             remaining: formatDuration(hours, t)
-          })
+          }),
+          runout === null
+            ? null
+            : React.createElement(
+                'span',
+                { className: 'dbp_runout', 'data-balance-rate-runout': true },
+                t('panel.runoutAt', { time: formatBeijingDateTime(runout.at) })
+              )
         )
       )
     }
@@ -4345,7 +4649,12 @@ function BalancePanel(props) {
     React.createElement(
       'p',
       { className: 'dbp_meta', key: 'rule-text' },
-      t('panel.rule', { low: formatThreshold(settings.low), warn: formatThreshold(settings.warn) })
+      // v0.3.0 起阈值行带上**当前钱包币种**的符号（词条不再写死 ¥）：
+      // 阈值比较的是展示币种的金额，美元账号此前会看到「低于 ¥3 显示红色」。
+      t('panel.rule', {
+        low: thresholdText(settings.low, summary?.currency ?? '', locale),
+        warn: thresholdText(settings.warn, summary?.currency ?? '', locale)
+      })
     ),
     React.createElement('p', { className: 'dbp_meta', key: 'settings-hint' }, t('panel.settingsHint'))
   )
@@ -4778,7 +5087,9 @@ function BalanceSettingsRow(props) {
         onChange: (value) => {
           set({ pollMs: Number(value) })
         },
-        options: POLL_CHOICES.map((ms) => ({
+        // v0.3.0 起选项列表会把「不在档位里的当前值」动态并进去：存储里存过
+        // 15000 这类自定义值时，受控下拉否则会渲染成空白（没有任何选中项）。
+        options: pollChoiceList(settings.pollMs).map((ms) => ({
           value: String(ms),
           label: ms === 0 ? t('settings.poll.manual') : t('settings.poll.seconds', { count: ms / 1000 })
         }))
@@ -4939,7 +5250,7 @@ function BalanceSettingsRow(props) {
  * 本文件由 scripts/build.mjs 生成，请勿手工编辑。
  * 修改样式请编辑 src/client/styles.css，然后运行 `node scripts/build.mjs`。
  */
-const STYLES = "/*\n * 余额徽章 —— 样式表。\n *\n * 视觉目标是「看起来像宿主自己画的」：徽章沿用 ContextMeter 触发器与\n * StatsPills 胶囊的同一套尺寸（13px 字号、20px 行高、1px 8px 内边距、\n * tabular-nums），展开面板沿用宿主统计气泡面板的同一套表面与阴影令牌。\n * 唯一新增的是档位配色：正常绿、偏低橙、不足红。\n */\n\n/*\n * 档位色定义在 `:root` 上，而不是只挂在 `.dbp_root` 上。\n *\n * 原因：展开面板是 portal 到 `document.body` 的，**不在 `.dbp_root` 子树里** ——\n * 只在徽章上定义这三个变量，面板里的 `var(--dbp-warn)` 就会解析失败，而\n * `color-mix(in srgb, var(--x) 14%, transparent)` 在变量无效时整条声明被丢弃，\n * SVG 于是回落到继承色（黑板一样的黑色）。这在 v1.2 画趋势图时暴露出来。\n *\n * 挂到 `:root` 后徽章与面板共享同一份定义；`body[data-ds-dark-theme]` 的覆盖\n * 本来就在根级，优先级仍然正确。\n */\n:root {\n  /* 档位色：优先用主题令牌，令牌缺失时回落到自带色值。 */\n  --dbp-ok: var(--dsw-alias-state-success-primary, #1f8f5f);\n  --dbp-warn: #c07a12;\n  --dbp-low: var(--dsw-alias-state-error-primary, #d93a45);\n  /*\n   * 时段色（v1.3）：高峰 = 贵，用暖色；空闲 = 便宜，用绿色。\n   *\n   * 同样必须定义在 `:root` 上：面板 portal 到 `body`，`.dbp_tariffBadge` 不在\n   * `.dbp_root` 子树里，把变量挂在徽章上会让面板里的 `var()` 解析失败。\n   */\n  --dbp-peak: #c07a12;\n  --dbp-offpeak: var(--dsw-alias-state-success-primary, #1f8f5f);\n}\n\nbody[data-ds-dark-theme] {\n  --dbp-ok: #4bbf8b;\n  --dbp-warn: #e2a13c;\n  --dbp-low: #f06a6a;\n  --dbp-peak: #e2a13c;\n  --dbp-offpeak: #4bbf8b;\n}\n\n.dbp_root {\n  /* 行内顺序：宿主两个统计胶囊是 order 0，上下文环（ContextMeter）也是 0，\n     这里用 order:1 把自己排到它们右侧，即整行末尾。 */\n  order: 1;\n  flex: none;\n  display: inline-flex;\n}\n\n.dbp_trigger {\n  box-sizing: border-box;\n  border: none;\n  background: 0 0;\n  padding: 1px 8px;\n  border-radius: var(--dsw-radius-sm);\n  font-family: inherit;\n  font-size: var(--dsh-content-font-size-secondary, 13px);\n  font-variant-numeric: tabular-nums;\n  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));\n  white-space: nowrap;\n  cursor: pointer;\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  color: var(--dsw-alias-label-tertiary);\n  transition: color 0.15s ease, background-color 0.15s ease;\n}\n\n.dbp_trigger:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_text {\n  font-weight: 500;\n}\n\n.dbp_icon {\n  flex: none;\n  display: block;\n}\n\n/* ---------------------------------------------------------------- 档位配色 */\n\n.dbp_root[data-status='loading'] .dbp_trigger,\n.dbp_root[data-status='signed-out'] .dbp_trigger,\n.dbp_root[data-status='failed'] .dbp_trigger {\n  color: var(--dsw-alias-label-tertiary);\n}\n\n/* ready 与 stale 用同一套档位色：stale 只是「这个数字可能过期」，\n   颜色仍然表达余额本身的高低，否则一次网络抖动会让红色警示凭空消失。 */\n.dbp_root[data-level='ok'][data-status='ready'] .dbp_trigger,\n.dbp_root[data-level='ok'][data-status='stale'] .dbp_trigger {\n  color: var(--dbp-ok);\n}\n\n.dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger,\n.dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger {\n  color: var(--dbp-warn);\n  background-color: color-mix(in srgb, var(--dbp-warn) 10%, transparent);\n}\n\n.dbp_root[data-level='low'][data-status='ready'] .dbp_trigger,\n.dbp_root[data-level='low'][data-status='stale'] .dbp_trigger {\n  color: var(--dbp-low);\n  background-color: color-mix(in srgb, var(--dbp-low) 12%, transparent);\n  font-weight: 600;\n}\n\n/* 过期态：档位色保留，但整体降一点不透明度，并给个虚线下划线，\n   让「数字还在、但不是最新」这件事在颜色之外还有第二个信号。 */\n.dbp_root[data-status='stale'] .dbp_trigger {\n  opacity: 0.75;\n}\n\n.dbp_root[data-status='stale'] .dbp_text {\n  text-decoration: underline dotted currentColor;\n  text-underline-offset: 3px;\n}\n\n.dbp_root[data-status='failed'] .dbp_trigger {\n  color: var(--dbp-warn);\n}\n\n.dbp_trigger:hover {\n  background-color: color-mix(in srgb, currentColor 14%, transparent);\n}\n\n.dbp_root[data-level='low'][data-status='ready'] .dbp_trigger:hover,\n.dbp_root[data-level='low'][data-status='stale'] .dbp_trigger:hover,\n.dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger:hover,\n.dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger:hover {\n  background-color: color-mix(in srgb, currentColor 20%, transparent);\n}\n\n/* ---------------------------------------------------------------- 展开面板 */\n\n.dbp_panel {\n  box-sizing: border-box;\n  position: fixed;\n  z-index: 1100;\n  /* 内容随历史/时段变多；小窗口或大字号下必须自己滚动，否则顶部会被视口裁掉。\n     内联样式会再按徽章上方的实际空间收紧 max-height（见 pill.js usePanelPosition）。 */\n  max-height: calc(100vh - 24px);\n  overflow-y: auto;\n  overscroll-behavior: contain;\n  padding: 12px;\n  border: 0;\n  border-radius: var(--dsw-radius-lg);\n  background: var(--dsw-specific-menu);\n  backdrop-filter: var(--dsw-menu-backdrop-filter);\n  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);\n  box-shadow: var(--dsw-elevation-prominent);\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 20px;\n  cursor: default;\n}\n\n.dbp_panelHead {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n}\n\n.dbp_panelTitle {\n  color: var(--dsw-alias-label-primary);\n  font-size: 13px;\n  font-weight: 500;\n}\n\n/* 面板标题旁的版本号：诊断用，弱化到不抢标题与刷新按钮。 */\n.dbp_panelVersion {\n  flex: none;\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 11px;\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_refresh {\n  box-sizing: border-box;\n  margin-left: auto;\n  padding: 0 8px;\n  height: 24px;\n  border: 0.5px solid var(--dsw-alias-border-l2);\n  border-radius: var(--dsw-radius-sm);\n  background: 0 0;\n  color: var(--dsw-alias-label-secondary);\n  font-family: inherit;\n  font-size: 12px;\n  line-height: 22px;\n  cursor: pointer;\n}\n\n.dbp_refresh:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.dbp_refresh:disabled {\n  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-tertiary));\n  cursor: default;\n}\n\n.dbp_refresh:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_rule {\n  height: 1px;\n  margin: 10px 0;\n  background: var(--dsw-alias-border-l1);\n}\n\n.dbp_rows {\n  display: grid;\n  grid-template-columns: 1fr auto;\n  gap: 4px 12px;\n  margin: 0;\n}\n\n.dbp_rows dt {\n  color: var(--dsw-alias-label-tertiary);\n  font-weight: 400;\n}\n\n.dbp_rows dd {\n  margin: 0;\n  text-align: right;\n  font-variant-numeric: tabular-nums;\n  color: var(--dsw-alias-label-primary);\n}\n\n.dbp_totalKey {\n  padding-top: 4px;\n  color: var(--dsw-alias-label-secondary) !important;\n}\n\n.dbp_totalValue {\n  padding-top: 4px;\n  font-weight: 600;\n}\n\n.dbp_hint {\n  margin: 10px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.dbp_hint[data-level='ok'] {\n  color: var(--dbp-ok);\n}\n\n.dbp_hint[data-level='warn'] {\n  color: var(--dbp-warn);\n}\n\n.dbp_hint[data-level='low'] {\n  color: var(--dbp-low);\n}\n\n.dbp_message {\n  margin: 0;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.dbp_stale {\n  margin: 0 0 8px;\n  padding: 5px 8px;\n  border-radius: var(--dsw-radius-sm);\n  background: color-mix(in srgb, var(--dbp-warn) 12%, transparent);\n  color: var(--dbp-warn);\n}\n\n.dbp_meta {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n/* ------------------------------------------------------------ 会话消耗与趋势 */\n\n.dbp_spend {\n  margin: 8px 0 0;\n  padding: 5px 8px;\n  border-radius: var(--dsw-radius-sm);\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-secondary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 今日已用：与「本轮会话」同一族信息，但**不加底纹** —— 底纹在面板里是\n   「这是你刚问的那件事」的强调，日消耗是背景信息，跟着一起高亮会稀释重点。 */\n.dbp_today {\n  margin: 6px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 本周已用：与「今日已用」同族同样式，仅 margin 与上一行拉开一点。 */\n.dbp_week {\n  margin: 4px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 近 7 天已用：与「本周」同族；再轻一点，避免三行消耗挤在一起抢注意力。 */\n.dbp_recent {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_trend {\n  margin: 10px 0 0;\n}\n\n.dbp_spark {\n  display: block;\n  width: 100%;\n  height: 40px;\n}\n\n.dbp_sparkLine {\n  fill: none;\n  stroke: var(--dsw-alias-label-tertiary);\n  stroke-width: 1.5;\n  stroke-linejoin: round;\n  stroke-linecap: round;\n  vector-effect: non-scaling-stroke;\n}\n\n.dbp_sparkArea {\n  fill: color-mix(in srgb, var(--dsw-alias-label-tertiary) 14%, transparent);\n  stroke: none;\n}\n\n/* 余额在涨（充值）用 success 色，在跌（消耗）用 warning 色。 */\n.dbp_trend[data-tone='up'] .dbp_sparkLine {\n  stroke: var(--dbp-ok);\n}\n\n.dbp_trend[data-tone='up'] .dbp_sparkArea {\n  fill: color-mix(in srgb, var(--dbp-ok) 16%, transparent);\n}\n\n.dbp_trend[data-tone='down'] .dbp_sparkLine {\n  stroke: var(--dbp-warn);\n}\n\n.dbp_trend[data-tone='down'] .dbp_sparkArea {\n  fill: color-mix(in srgb, var(--dbp-warn) 14%, transparent);\n}\n\n.dbp_trendFoot {\n  display: flex;\n  justify-content: space-between;\n  margin-top: 2px;\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 11px;\n  font-variant-numeric: tabular-nums;\n}\n\n/* ---------------------------------------------------------------- 计费时段 */\n\n/*\n * 状态行徽章上的时段标签。11px 是「比徽章数字小一档、但仍看得清」的尺寸。\n *\n * 底色只用一成多的透明度：档位色（绿/橙/红）说的是「钱还够不够」，时段色说的是\n * 「这个价贵不贵」，两件事不该混成一片抢注意力的色块，因此时段只做淡底 + 同色字。\n * 颜色取自 `:root` 的 `--dbp-peak` / `--dbp-offpeak`（面板 portal 到 body，\n * 变量挂在 `.dbp_root` 上的话面板里的徽标会取不到）。\n */\n.dbp_tariff {\n  flex: none;\n  padding: 0 5px;\n  border-radius: var(--dsw-radius-sm);\n  font-size: 11px;\n  line-height: 16px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n\n.dbp_root[data-tariff='peak'] .dbp_tariff {\n  color: var(--dbp-peak);\n  background-color: color-mix(in srgb, var(--dbp-peak) 14%, transparent);\n}\n\n.dbp_root[data-tariff='off-peak'] .dbp_tariff {\n  color: var(--dbp-offpeak);\n  background-color: color-mix(in srgb, var(--dbp-offpeak) 14%, transparent);\n}\n\n/* 面板里的时段行：一枚徽标 + 一句结论，排在金额明细与档位提示之间。 */\n.dbp_tariffRow {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  margin: 8px 0 0;\n}\n\n.dbp_tariffBadge {\n  flex: none;\n  padding: 0 5px;\n  border-radius: var(--dsw-radius-sm);\n  font-size: 11px;\n  line-height: 16px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n\n.dbp_tariffBadge[data-tariff='peak'] {\n  color: var(--dbp-peak);\n  background: color-mix(in srgb, var(--dbp-peak) 14%, transparent);\n}\n\n.dbp_tariffBadge[data-tariff='off-peak'] {\n  color: var(--dbp-offpeak);\n  background: color-mix(in srgb, var(--dbp-offpeak) 14%, transparent);\n}\n\n/* 徽标后面那句结论：长句要能换行，因此允许收缩（flex 默认 min-width:auto 会撑破面板）。 */\n.dbp_tariffNote {\n  min-width: 0;\n}\n\n/* 时段明细行：倒计时、本段区间、价格、峰谷预估、日历覆盖。 */\n.dbp_tariffMeta {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_topUp {\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  width: 100%;\n  height: 32px;\n  margin-top: 10px;\n  border: 0.5px solid var(--dsw-alias-border-l3);\n  border-radius: var(--dsw-radius-md);\n  color: var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary));\n  text-decoration: none;\n}\n\n.dbp_topUp:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.dbp_topUp:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 2px;\n}\n\n/* ---------------------------------------------------------------- 设置行 */\n\n/*\n * 版式对齐宿主「设置 → 常规」里的行：上下 16px 内边距、底部 0.5px 分隔线、\n * 左侧标题 14px + 描述 12px、右侧控件。最后一行由宿主的\n * `[data-slot] > :last-child { border-bottom: none }` 处理，这里不用管。\n */\n.dbp_setRoot {\n  display: flex;\n  flex-direction: column;\n  width: 100%;\n}\n\n.dbp_setHead {\n  padding: 4px 0 12px;\n}\n\n.dbp_setHeadTitle {\n  font-size: 14px;\n  font-weight: 600;\n}\n\n/* 计费时段三行前面的分组说明：与根标题同版式，但要和上一行拉开距离（v1.3）。 */\n.dbp_setGroup {\n  padding: 14px 0 4px;\n}\n\n.dbp_setGroupTitle {\n  font-weight: 600;\n}\n\n.dbp_setRow {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 24px;\n  padding: 16px 0;\n  border-bottom: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n.dbp_setRow[data-disabled='true'] {\n  opacity: 0.6;\n}\n\n.dbp_setCopy {\n  min-width: 0;\n}\n\n.dbp_setTitle {\n  color: var(--dsw-alias-label-primary);\n  font-size: 14px;\n  line-height: 20px;\n}\n\n.dbp_setDescription {\n  margin-top: 4px;\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.dbp_setControl {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.dbp_setPair {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n}\n\n.dbp_setNotice {\n  margin-bottom: 4px;\n  padding: 8px 12px;\n  border-radius: var(--dsw-radius-md);\n  background: color-mix(in srgb, var(--dbp-warn) 12%, transparent);\n  color: var(--dbp-warn);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.dbp_select,\n.dbp_number {\n  box-sizing: border-box;\n  height: 32px;\n  padding: 0 8px;\n  border: 0.5px solid var(--dsw-alias-border-l3);\n  border-radius: var(--dsw-radius-md);\n  background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-1));\n  color: var(--dsw-alias-label-primary);\n  font-family: inherit;\n  font-size: 13px;\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_select {\n  min-width: 168px;\n  max-width: 260px;\n}\n\n.dbp_number {\n  width: 72px;\n  text-align: right;\n}\n\n.dbp_select:hover,\n.dbp_number:hover {\n  border-color: var(--dsw-alias-border-l4);\n}\n\n.dbp_select:focus-visible,\n.dbp_number:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_check {\n  display: inline-flex;\n  align-items: center;\n}\n\n.dbp_check input {\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-state-business-primary);\n  cursor: pointer;\n}\n\n.dbp_setFoot {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  padding-top: 14px;\n}\n\n.dbp_setButton {\n  box-sizing: border-box;\n  height: 32px;\n  padding: 0 14px;\n  border: 0.5px solid var(--dsw-alias-border-l3);\n  border-radius: var(--dsw-radius-md);\n  background: 0 0;\n  color: var(--dsw-alias-label-primary);\n  font-family: inherit;\n  font-size: 13px;\n  cursor: pointer;\n}\n\n.dbp_setButton:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.dbp_setButton:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_setHint {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n/* 紧凑模式：徽章不带币种符号，去掉一点横向内边距。 */\n.dbp_root[data-compact='true'] .dbp_trigger {\n  padding: 1px 6px;\n}\n\n/* ---------------------------------------------------------------- 提醒卡片 */\n\n/*\n * 只在宿主 primitives 的 Toast 拿不到时才出现（见 alert-toast.js）。\n * 宿主 Toast 自己 portal 到 body 并占 z-index:1100；这张兜底卡片挂在\n * `shell.overlay` 里（z-index:20 的浮层，子元素自带 pointer-events:auto），\n * 因此定位用 absolute 贴右下角即可，不必自己抬层级。\n */\n.dbp_alert {\n  position: absolute;\n  right: 16px;\n  bottom: 16px;\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  max-width: min(420px, calc(100vw - 32px));\n  padding: 10px 12px;\n  border-radius: var(--dsw-radius-lg);\n  background: var(--dsw-alias-toast-bg, var(--dsw-specific-menu));\n  color: var(--dsw-alias-toast-label, #fff);\n  box-shadow: var(--dsw-elevation-prominent);\n  font-size: 13px;\n  line-height: 20px;\n}\n\n.dbp_alertText {\n  min-width: 0;\n}\n\n.dbp_alertAction {\n  flex: none;\n  height: 26px;\n  padding: 0 10px;\n  border: 0.5px solid currentColor;\n  border-radius: var(--dsw-radius-sm);\n  background: 0 0;\n  color: inherit;\n  font-family: inherit;\n  font-size: 12px;\n  cursor: pointer;\n}\n\n.dbp_alertAction:hover {\n  background: rgba(255, 255, 255, 0.14);\n}\n\n.dbp_alertAction:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_alert[data-level='low'] .dbp_alertAction {\n  color: var(--dbp-low);\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .dbp_trigger {\n    transition: none;\n  }\n}\n"
+const STYLES = "/*\n * 余额徽章 —— 样式表。\n *\n * 视觉目标是「看起来像宿主自己画的」：徽章沿用 ContextMeter 触发器与\n * StatsPills 胶囊的同一套尺寸（13px 字号、20px 行高、1px 8px 内边距、\n * tabular-nums），展开面板沿用宿主统计气泡面板的同一套表面与阴影令牌。\n * 唯一新增的是档位配色：正常绿、偏低橙、不足红。\n */\n\n/*\n * 档位色定义在 `:root` 上，而不是只挂在 `.dbp_root` 上。\n *\n * 原因：展开面板是 portal 到 `document.body` 的，**不在 `.dbp_root` 子树里** ——\n * 只在徽章上定义这三个变量，面板里的 `var(--dbp-warn)` 就会解析失败，而\n * `color-mix(in srgb, var(--x) 14%, transparent)` 在变量无效时整条声明被丢弃，\n * SVG 于是回落到继承色（黑板一样的黑色）。这在 v1.2 画趋势图时暴露出来。\n *\n * 挂到 `:root` 后徽章与面板共享同一份定义；`body[data-ds-dark-theme]` 的覆盖\n * 本来就在根级，优先级仍然正确。\n */\n:root {\n  /* 档位色：优先用主题令牌，令牌缺失时回落到自带色值。 */\n  --dbp-ok: var(--dsw-alias-state-success-primary, #1f8f5f);\n  --dbp-warn: #c07a12;\n  --dbp-low: var(--dsw-alias-state-error-primary, #d93a45);\n  /*\n   * 时段色（v1.3）：高峰 = 贵，用暖色；空闲 = 便宜，用绿色。\n   *\n   * 同样必须定义在 `:root` 上：面板 portal 到 `body`，`.dbp_tariffBadge` 不在\n   * `.dbp_root` 子树里，把变量挂在徽章上会让面板里的 `var()` 解析失败。\n   */\n  --dbp-peak: #c07a12;\n  --dbp-offpeak: var(--dsw-alias-state-success-primary, #1f8f5f);\n}\n\nbody[data-ds-dark-theme] {\n  --dbp-ok: #4bbf8b;\n  --dbp-warn: #e2a13c;\n  --dbp-low: #f06a6a;\n  --dbp-peak: #e2a13c;\n  --dbp-offpeak: #4bbf8b;\n}\n\n.dbp_root {\n  /* 行内顺序：宿主两个统计胶囊是 order 0，上下文环（ContextMeter）也是 0，\n     这里用 order:1 把自己排到它们右侧，即整行末尾。 */\n  order: 1;\n  flex: none;\n  display: inline-flex;\n}\n\n.dbp_trigger {\n  box-sizing: border-box;\n  border: none;\n  background: 0 0;\n  padding: 1px 8px;\n  border-radius: var(--dsw-radius-sm);\n  font-family: inherit;\n  font-size: var(--dsh-content-font-size-secondary, 13px);\n  font-variant-numeric: tabular-nums;\n  line-height: calc(20px + var(--dsh-content-font-delta-secondary, 0px));\n  white-space: nowrap;\n  cursor: pointer;\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  color: var(--dsw-alias-label-tertiary);\n  transition: color 0.15s ease, background-color 0.15s ease;\n}\n\n.dbp_trigger:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_text {\n  font-weight: 500;\n}\n\n.dbp_icon {\n  flex: none;\n  display: block;\n}\n\n/* ---------------------------------------------------------------- 档位配色 */\n\n.dbp_root[data-status='loading'] .dbp_trigger,\n.dbp_root[data-status='signed-out'] .dbp_trigger,\n.dbp_root[data-status='failed'] .dbp_trigger {\n  color: var(--dsw-alias-label-tertiary);\n}\n\n/* ready 与 stale 用同一套档位色：stale 只是「这个数字可能过期」，\n   颜色仍然表达余额本身的高低，否则一次网络抖动会让红色警示凭空消失。 */\n.dbp_root[data-level='ok'][data-status='ready'] .dbp_trigger,\n.dbp_root[data-level='ok'][data-status='stale'] .dbp_trigger {\n  color: var(--dbp-ok);\n}\n\n.dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger,\n.dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger {\n  color: var(--dbp-warn);\n  background-color: color-mix(in srgb, var(--dbp-warn) 10%, transparent);\n}\n\n.dbp_root[data-level='low'][data-status='ready'] .dbp_trigger,\n.dbp_root[data-level='low'][data-status='stale'] .dbp_trigger {\n  color: var(--dbp-low);\n  background-color: color-mix(in srgb, var(--dbp-low) 12%, transparent);\n  font-weight: 600;\n}\n\n/* 过期态：档位色保留，但整体降一点不透明度，并给个虚线下划线，\n   让「数字还在、但不是最新」这件事在颜色之外还有第二个信号。 */\n.dbp_root[data-status='stale'] .dbp_trigger {\n  opacity: 0.75;\n}\n\n.dbp_root[data-status='stale'] .dbp_text {\n  text-decoration: underline dotted currentColor;\n  text-underline-offset: 3px;\n}\n\n.dbp_root[data-status='failed'] .dbp_trigger {\n  color: var(--dbp-warn);\n}\n\n.dbp_trigger:hover {\n  background-color: color-mix(in srgb, currentColor 14%, transparent);\n}\n\n.dbp_root[data-level='low'][data-status='ready'] .dbp_trigger:hover,\n.dbp_root[data-level='low'][data-status='stale'] .dbp_trigger:hover,\n.dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger:hover,\n.dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger:hover {\n  background-color: color-mix(in srgb, currentColor 20%, transparent);\n}\n\n/* ---------------------------------------------------------------- 展开面板 */\n\n.dbp_panel {\n  box-sizing: border-box;\n  position: fixed;\n  z-index: 1100;\n  /* 内容随历史/时段变多；小窗口或大字号下必须自己滚动，否则顶部会被视口裁掉。\n     内联样式会再按徽章上方的实际空间收紧 max-height（见 pill.js usePanelPosition）。 */\n  max-height: calc(100vh - 24px);\n  overflow-y: auto;\n  overscroll-behavior: contain;\n  padding: 12px;\n  border: 0;\n  border-radius: var(--dsw-radius-lg);\n  background: var(--dsw-specific-menu);\n  backdrop-filter: var(--dsw-menu-backdrop-filter);\n  --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);\n  box-shadow: var(--dsw-elevation-prominent);\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 20px;\n  cursor: default;\n}\n\n.dbp_panelHead {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n}\n\n.dbp_panelTitle {\n  color: var(--dsw-alias-label-primary);\n  font-size: 13px;\n  font-weight: 500;\n}\n\n/* 面板标题旁的版本号：诊断用，弱化到不抢标题与刷新按钮。 */\n.dbp_panelVersion {\n  flex: none;\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 11px;\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_refresh {\n  box-sizing: border-box;\n  margin-left: auto;\n  padding: 0 8px;\n  height: 24px;\n  border: 0.5px solid var(--dsw-alias-border-l2);\n  border-radius: var(--dsw-radius-sm);\n  background: 0 0;\n  color: var(--dsw-alias-label-secondary);\n  font-family: inherit;\n  font-size: 12px;\n  line-height: 22px;\n  cursor: pointer;\n}\n\n.dbp_refresh:hover:not(:disabled) {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.dbp_refresh:disabled {\n  color: var(--dsw-alias-label-caption, var(--dsw-alias-label-tertiary));\n  cursor: default;\n}\n\n.dbp_refresh:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_rule {\n  height: 1px;\n  margin: 10px 0;\n  background: var(--dsw-alias-border-l1);\n}\n\n.dbp_rows {\n  display: grid;\n  grid-template-columns: 1fr auto;\n  gap: 4px 12px;\n  margin: 0;\n}\n\n.dbp_rows dt {\n  color: var(--dsw-alias-label-tertiary);\n  font-weight: 400;\n}\n\n.dbp_rows dd {\n  margin: 0;\n  text-align: right;\n  font-variant-numeric: tabular-nums;\n  color: var(--dsw-alias-label-primary);\n}\n\n.dbp_totalKey {\n  padding-top: 4px;\n  color: var(--dsw-alias-label-secondary) !important;\n}\n\n.dbp_totalValue {\n  padding-top: 4px;\n  font-weight: 600;\n}\n\n.dbp_hint {\n  margin: 10px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.dbp_hint[data-level='ok'] {\n  color: var(--dbp-ok);\n}\n\n.dbp_hint[data-level='warn'] {\n  color: var(--dbp-warn);\n}\n\n.dbp_hint[data-level='low'] {\n  color: var(--dbp-low);\n}\n\n.dbp_message {\n  margin: 0;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.dbp_stale {\n  margin: 0 0 8px;\n  padding: 5px 8px;\n  border-radius: var(--dsw-radius-sm);\n  background: color-mix(in srgb, var(--dbp-warn) 12%, transparent);\n  color: var(--dbp-warn);\n}\n\n.dbp_meta {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n/* ------------------------------------------------------------ 会话消耗与趋势 */\n\n.dbp_spend {\n  margin: 8px 0 0;\n  padding: 5px 8px;\n  border-radius: var(--dsw-radius-sm);\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-secondary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 今日已用：与「本轮会话」同一族信息，但**不加底纹** —— 底纹在面板里是\n   「这是你刚问的那件事」的强调，日消耗是背景信息，跟着一起高亮会稀释重点。 */\n.dbp_today {\n  margin: 6px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 本周已用：与「今日已用」同族同样式，仅 margin 与上一行拉开一点。 */\n.dbp_week {\n  margin: 4px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 近 7 天已用：与「本周」同族；再轻一点，避免三行消耗挤在一起抢注意力。 */\n.dbp_recent {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 最近充值（v0.2.0）：与「近 7 天」同族。入账是好消息，颜色跟随文本不额外\n   加重 —— 面板里带颜色的元素应该只在「需要决策」时出现。 */\n.dbp_topup {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n/* 余额跑道（v0.3.0）：与「近 7 天」同族的背景信息，同样不加底纹、不加重。\n   它是预测，不是事实，视觉上必须比金额明细更轻。 */\n.dbp_runway {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_trend {\n  margin: 10px 0 0;\n}\n\n.dbp_spark {\n  display: block;\n  width: 100%;\n  height: 40px;\n}\n\n.dbp_sparkLine {\n  fill: none;\n  stroke: var(--dsw-alias-label-tertiary);\n  stroke-width: 1.5;\n  stroke-linejoin: round;\n  stroke-linecap: round;\n  vector-effect: non-scaling-stroke;\n}\n\n.dbp_sparkArea {\n  fill: color-mix(in srgb, var(--dsw-alias-label-tertiary) 14%, transparent);\n  stroke: none;\n}\n\n/* 余额在涨（充值）用 success 色，在跌（消耗）用 warning 色。 */\n.dbp_trend[data-tone='up'] .dbp_sparkLine {\n  stroke: var(--dbp-ok);\n}\n\n.dbp_trend[data-tone='up'] .dbp_sparkArea {\n  fill: color-mix(in srgb, var(--dbp-ok) 16%, transparent);\n}\n\n.dbp_trend[data-tone='down'] .dbp_sparkLine {\n  stroke: var(--dbp-warn);\n}\n\n.dbp_trend[data-tone='down'] .dbp_sparkArea {\n  fill: color-mix(in srgb, var(--dbp-warn) 14%, transparent);\n}\n\n.dbp_trendFoot {\n  display: flex;\n  justify-content: space-between;\n  margin-top: 2px;\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 11px;\n  font-variant-numeric: tabular-nums;\n}\n\n/* ---------------------------------------------------------------- 计费时段 */\n\n/*\n * 状态行徽章上的时段标签。11px 是「比徽章数字小一档、但仍看得清」的尺寸。\n *\n * 底色只用一成多的透明度：档位色（绿/橙/红）说的是「钱还够不够」，时段色说的是\n * 「这个价贵不贵」，两件事不该混成一片抢注意力的色块，因此时段只做淡底 + 同色字。\n * 颜色取自 `:root` 的 `--dbp-peak` / `--dbp-offpeak`（面板 portal 到 body，\n * 变量挂在 `.dbp_root` 上的话面板里的徽标会取不到）。\n */\n.dbp_tariff {\n  flex: none;\n  padding: 0 5px;\n  border-radius: var(--dsw-radius-sm);\n  font-size: 11px;\n  line-height: 16px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n\n.dbp_root[data-tariff='peak'] .dbp_tariff {\n  color: var(--dbp-peak);\n  background-color: color-mix(in srgb, var(--dbp-peak) 14%, transparent);\n}\n\n.dbp_root[data-tariff='off-peak'] .dbp_tariff {\n  color: var(--dbp-offpeak);\n  background-color: color-mix(in srgb, var(--dbp-offpeak) 14%, transparent);\n}\n\n/* 面板里的时段行：一枚徽标 + 一句结论，排在金额明细与档位提示之间。 */\n.dbp_tariffRow {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  margin: 8px 0 0;\n}\n\n.dbp_tariffBadge {\n  flex: none;\n  padding: 0 5px;\n  border-radius: var(--dsw-radius-sm);\n  font-size: 11px;\n  line-height: 16px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n\n.dbp_tariffBadge[data-tariff='peak'] {\n  color: var(--dbp-peak);\n  background: color-mix(in srgb, var(--dbp-peak) 14%, transparent);\n}\n\n.dbp_tariffBadge[data-tariff='off-peak'] {\n  color: var(--dbp-offpeak);\n  background: color-mix(in srgb, var(--dbp-offpeak) 14%, transparent);\n}\n\n/* 徽标后面那句结论：长句要能换行，因此允许收缩（flex 默认 min-width:auto 会撑破面板）。 */\n.dbp_tariffNote {\n  min-width: 0;\n}\n\n/* 时段明细行：倒计时、本段区间、价格、峰谷预估、日历覆盖。 */\n.dbp_tariffMeta {\n  margin: 2px 0 0;\n  color: var(--dsw-alias-label-tertiary);\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_topUp {\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  justify-content: center;\n  width: 100%;\n  height: 32px;\n  margin-top: 10px;\n  border: 0.5px solid var(--dsw-alias-border-l3);\n  border-radius: var(--dsw-radius-md);\n  color: var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary));\n  text-decoration: none;\n}\n\n.dbp_topUp:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.dbp_topUp:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 2px;\n}\n\n/* ---------------------------------------------------------------- 设置行 */\n\n/*\n * 版式对齐宿主「设置 → 常规」里的行：上下 16px 内边距、底部 0.5px 分隔线、\n * 左侧标题 14px + 描述 12px、右侧控件。最后一行由宿主的\n * `[data-slot] > :last-child { border-bottom: none }` 处理，这里不用管。\n */\n.dbp_setRoot {\n  display: flex;\n  flex-direction: column;\n  width: 100%;\n}\n\n.dbp_setHead {\n  padding: 4px 0 12px;\n}\n\n.dbp_setHeadTitle {\n  font-size: 14px;\n  font-weight: 600;\n}\n\n/* 计费时段三行前面的分组说明：与根标题同版式，但要和上一行拉开距离（v1.3）。 */\n.dbp_setGroup {\n  padding: 14px 0 4px;\n}\n\n.dbp_setGroupTitle {\n  font-weight: 600;\n}\n\n.dbp_setRow {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 24px;\n  padding: 16px 0;\n  border-bottom: 0.5px solid var(--dsw-alias-border-l2);\n}\n\n.dbp_setRow[data-disabled='true'] {\n  opacity: 0.6;\n}\n\n.dbp_setCopy {\n  min-width: 0;\n}\n\n.dbp_setTitle {\n  color: var(--dsw-alias-label-primary);\n  font-size: 14px;\n  line-height: 20px;\n}\n\n.dbp_setDescription {\n  margin-top: 4px;\n  color: var(--dsw-alias-label-secondary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.dbp_setControl {\n  display: flex;\n  flex: none;\n  align-items: center;\n  gap: 8px;\n}\n\n.dbp_setPair {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n}\n\n.dbp_setNotice {\n  margin-bottom: 4px;\n  padding: 8px 12px;\n  border-radius: var(--dsw-radius-md);\n  background: color-mix(in srgb, var(--dbp-warn) 12%, transparent);\n  color: var(--dbp-warn);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n.dbp_select,\n.dbp_number {\n  box-sizing: border-box;\n  height: 32px;\n  padding: 0 8px;\n  border: 0.5px solid var(--dsw-alias-border-l3);\n  border-radius: var(--dsw-radius-md);\n  background: var(--dsw-specific-input-major, var(--dsw-alias-bg-layer-1));\n  color: var(--dsw-alias-label-primary);\n  font-family: inherit;\n  font-size: 13px;\n  font-variant-numeric: tabular-nums;\n}\n\n.dbp_select {\n  min-width: 168px;\n  max-width: 260px;\n}\n\n.dbp_number {\n  width: 72px;\n  text-align: right;\n}\n\n.dbp_select:hover,\n.dbp_number:hover {\n  border-color: var(--dsw-alias-border-l4);\n}\n\n.dbp_select:focus-visible,\n.dbp_number:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_check {\n  display: inline-flex;\n  align-items: center;\n}\n\n.dbp_check input {\n  width: 16px;\n  height: 16px;\n  margin: 0;\n  accent-color: var(--dsw-alias-state-business-primary);\n  cursor: pointer;\n}\n\n.dbp_setFoot {\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  padding-top: 14px;\n}\n\n.dbp_setButton {\n  box-sizing: border-box;\n  height: 32px;\n  padding: 0 14px;\n  border: 0.5px solid var(--dsw-alias-border-l3);\n  border-radius: var(--dsw-radius-md);\n  background: 0 0;\n  color: var(--dsw-alias-label-primary);\n  font-family: inherit;\n  font-size: 13px;\n  cursor: pointer;\n}\n\n.dbp_setButton:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.dbp_setButton:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_setHint {\n  color: var(--dsw-alias-label-tertiary);\n  font-size: 12px;\n  line-height: 18px;\n}\n\n/* 紧凑模式：徽章不带币种符号，去掉一点横向内边距。 */\n.dbp_root[data-compact='true'] .dbp_trigger {\n  padding: 1px 6px;\n}\n\n/* ---------------------------------------------------------------- 提醒卡片 */\n\n/*\n * 只在宿主 primitives 的 Toast 拿不到时才出现（见 alert-toast.js）。\n * 宿主 Toast 自己 portal 到 body 并占 z-index:1100；这张兜底卡片挂在\n * `shell.overlay` 里（z-index:20 的浮层，子元素自带 pointer-events:auto），\n * 因此定位用 absolute 贴右下角即可，不必自己抬层级。\n */\n.dbp_alert {\n  position: absolute;\n  right: 16px;\n  bottom: 16px;\n  box-sizing: border-box;\n  display: flex;\n  align-items: center;\n  gap: 12px;\n  max-width: min(420px, calc(100vw - 32px));\n  padding: 10px 12px;\n  border-radius: var(--dsw-radius-lg);\n  background: var(--dsw-alias-toast-bg, var(--dsw-specific-menu));\n  color: var(--dsw-alias-toast-label, #fff);\n  box-shadow: var(--dsw-elevation-prominent);\n  font-size: 13px;\n  line-height: 20px;\n}\n\n.dbp_alertText {\n  min-width: 0;\n}\n\n.dbp_alertAction {\n  flex: none;\n  height: 26px;\n  padding: 0 10px;\n  border: 0.5px solid currentColor;\n  border-radius: var(--dsw-radius-sm);\n  background: 0 0;\n  color: inherit;\n  font-family: inherit;\n  font-size: 12px;\n  cursor: pointer;\n}\n\n.dbp_alertAction:hover {\n  background: rgba(255, 255, 255, 0.14);\n}\n\n.dbp_alertAction:focus-visible {\n  outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));\n  outline-offset: 1px;\n}\n\n.dbp_alert[data-level='low'] .dbp_alertAction {\n  color: var(--dbp-low);\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .dbp_trigger {\n    transition: none;\n  }\n}\n"
 
 // ---- src/client/tariff-alert.js ------------------------------
 /**
@@ -5316,57 +5627,6 @@ function createTariffWatcher(options) {
   }
 }
 
-// ---- src/client/readings.js ----------------------------------
-/**
- * 余额徽章 —— 最近一次成功读数的共享槽位。
- *
- * ## 为什么需要它
- * 会话作用域的徽章与 root 作用域的时段看门狗（见 tariff-service.js）都要用到
- * 「余额现在是多少」。看门狗没法自己去读账号 —— 那会让同一个 Remote 被两处
- * 独立轮询，两边的数字还可能相差一个轮询周期 —— 于是让徽章把成功读数写进这个
- * 极薄的槽位，看门狗读它。
- *
- * 它是**只读快照 + 写入端**的共享状态，不参与 React 渲染：没有订阅者，也就不会
- * 引起额外重渲染。历史（history.js）记录的是采样点序列，而这里是「最后一条」，
- * 两者用途不同，因此不合并。
- */
-
-/** 槽位内容：`{amount, currency, at, perHour}`；从未读到过时为 null。 */
-let latest = null
-
-/**
- * 记录一次成功读数。
- * @param reading - `{amount, currency, at, perHour}`；`amount` 非法时忽略本次写入。
- */
-function recordReading(reading) {
-  if (reading === null || reading === undefined) return
-  const amount = Number(reading.amount)
-  if (!Number.isFinite(amount)) return
-  const perHour = Number(reading.perHour)
-  latest = {
-    amount,
-    currency: typeof reading.currency === 'string' ? reading.currency : '',
-    at: Number.isFinite(Number(reading.at)) ? Number(reading.at) : Date.now(),
-    /** 消耗速度（元/小时）；未知或非正数时为 null（与 balance.js 的口径一致）。 */
-    perHour: Number.isFinite(perHour) && perHour > 0 ? perHour : null
-  }
-}
-
-/** 当前槽位内容（只读快照）；从未写入时为 null。 */
-function latestReading() {
-  return latest
-}
-
-/**
- * 清空槽位。
- *
- * 只在单测里用：模块级状态会跨用例泄漏，测试必须能重置它。
- * 生产代码里余额只会因为「换账号」而失效，而那时下一次轮询会立刻覆盖它。
- */
-function resetReading() {
-  latest = null
-}
-
 // ---- src/client/index.js -------------------------------------
 /**
  * 余额徽章 —— 客户端插件入口。
@@ -5520,6 +5780,15 @@ function apply(ctx) {
   // 它**必须**在这里构造（而不是在组件里）：提醒状态机要跨会话存活，
   // 而徽章所在的槽位是会话作用域的。
   service.tariff = createTariffWatcher({ alerts: service.alerts })
+
+  // 余额跨档提醒的**状态机**（v0.3.0 起住在 service 上，跨会话存活）。
+  //
+  // 它此前是徽章组件里的 ref：切换会话会把「已提醒过哪个档位 / 冷却从何时
+  // 起算」一起丢掉 —— 30 分钟的全局冷却被会话切换重置，余额在阈值附近时
+  // 跨几次会话就可能补出几张重复的卡。提醒本身显示在 root 作用域的浮层上
+  // （账号级事件），状态机也该有同样的生命周期。徽章侧惰性初始化同一字段，
+  // 便于测试替身不预建它也能工作；生产路径在这里创建，全插件共享一份。
+  service.balanceAlertState = createAlertState()
 
   // 挂到输入框下方的状态行末尾（宿主自己的统计胶囊是 order 0，上下文环也是 0，
   // 本条目 order 50 先排在它们之后，再由样式表里的 flex `order:1` 落到最右侧）。

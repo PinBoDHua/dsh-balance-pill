@@ -13,11 +13,14 @@
  * ## 用法
  *   node scripts/install.mjs                      # 预览安装
  *   node scripts/install.mjs --apply              # 安装
+ *   node scripts/install.mjs --status             # 查看本地与已装副本的状态
  *   node scripts/install.mjs --sync-client --apply  # 只同步客户端产物（改完前端热更新用）
  *   node scripts/install.mjs --uninstall          # 预览卸载
  *   node scripts/install.mjs --apply --uninstall  # 卸载
  *
  * 备份写到 <DSH_HOME>/dsh-balance-pill-backup-<时间戳>/，并留一份 restore.ps1。
+ * v0.3.0 起**已安装的插件副本**也一并备份（此前只备份 profile 清单文件，
+ * 升级会直接删掉旧副本，回滚脚本恢复不出插件体）。
  */
 
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -31,6 +34,7 @@ const argv = process.argv.slice(2)
 const apply = argv.includes('--apply')
 const uninstall = argv.includes('--uninstall')
 const syncClientOnly = argv.includes('--sync-client')
+const showStatus = argv.includes('--status')
 
 /** 解析 profile 目录：优先环境变量，其次 DSH_HOME 下的 desktop profile。 */
 function resolveProfileDir() {
@@ -85,6 +89,47 @@ if (syncClientOnly) {
   process.exit(0)
 }
 
+// ------------------------------------------------------------ 状态查询
+
+// `--status`：回答「装没装、装的哪一版、与本地是否一致」。只读，不写盘。
+// 它服务的是 `--sync-client` 的工作流：改完前端后先看一眼已装副本落后多少，
+// 再决定是整包重装还是只同步客户端产物。
+if (showStatus) {
+  const localPkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  log(`本地         v${localPkg.version}（${ROOT}）`)
+  const installedPkgPath = join(targetDir, 'package.json')
+  if (!existsSync(installedPkgPath)) {
+    log('已安装       否（node scripts/install.mjs --apply 安装）')
+    process.exit(0)
+  }
+  const installedPkg = JSON.parse(readFileSync(installedPkgPath, 'utf8'))
+  log(`已安装       v${installedPkg.version ?? '?'}（${targetDir}）`)
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+  const inDeps = manifest.dependencies?.[PLUGIN_NAME] !== undefined
+  const inBundles =
+    Array.isArray(manifest.dsh?.profile?.bundles) && manifest.dsh.profile.bundles.includes(PLUGIN_NAME)
+  log(
+    `profile 登记 dependencies=${inDeps ? '是' : '否'} · bundles=${inBundles ? '是' : '否'}` +
+      (inDeps && inBundles ? '' : '（两处都应在 —— 缺失会让层栈组合不到这个插件）')
+  )
+  const localClient = join(ROOT, 'client', 'client.js')
+  const installedClient = join(targetDir, 'client', 'client.js')
+  if (!existsSync(localClient)) {
+    log('客户端产物   本地缺少 client/client.js —— 先运行 node scripts/build.mjs')
+  } else if (!existsSync(installedClient)) {
+    log('客户端产物   已装副本缺少 client/client.js —— 重新运行 --apply')
+  } else {
+    const a = readFileSync(localClient)
+    const b = readFileSync(installedClient)
+    log(
+      a.equals(b)
+        ? `客户端产物   与本地一致（${(a.length / 1024).toFixed(1)} KB）`
+        : `客户端产物   与本地不一致（本地 ${(a.length / 1024).toFixed(1)} KB / 已装 ${(b.length / 1024).toFixed(1)} KB）—— 运行 --apply 或 --sync-client --apply`
+    )
+  }
+  process.exit(0)
+}
+
 // ------------------------------------------------------------ 计算目标状态
 
 const original = readFileSync(manifestPath, 'utf8')
@@ -116,6 +161,7 @@ log(`  插件源     ${ROOT}`)
 log('')
 
 if (willCopy) change(`复制插件目录 -> ${targetDir}（复制前先移除旧副本）`)
+if (existsSync(targetDir)) change(`已装副本先备份 -> ${join(backupDir, 'plugin')}（v0.3.0 起，回滚脚本可恢复插件体）`)
 change(willWriteManifest ? `改写 ${manifestPath}` : 'package.json 无需改动（已是目标状态）')
 change(`备份 -> ${backupDir}`)
 log('')
@@ -143,6 +189,22 @@ function backup(relative) {
 
 const backedUp = ['package.json', 'cordis.patch.yml', 'pnpm-lock.yaml', 'pnpm-workspace.yaml'].filter(backup)
 
+// v0.3.0 起，已安装的插件副本也进备份：安装/升级会先整目录删除旧副本，
+// 此前只有 profile 清单文件可恢复，插件体删了就没了 —— 升级失败时用户只能
+// 重新找源码。备份失败必须中止（这正是在做「不可逆删除」前的最后一步），
+// 宁可不升级也不能把唯一一份已装副本销毁掉。
+if (existsSync(targetDir)) {
+  const pluginBackupDir = join(backupDir, 'plugin')
+  try {
+    mkdirSync(backupDir, { recursive: true })
+    cpSync(targetDir, pluginBackupDir, { recursive: true })
+    log(`已备份已装副本 -> ${pluginBackupDir}`)
+  } catch (error) {
+    console.error(`备份已装副本失败（${error.message}）—— 已中止，未做任何改动。`)
+    process.exit(2)
+  }
+}
+
 writeFileSync(
   join(backupDir, 'restore.ps1'),
   `# 余额徽章 —— 一键回滚到安装前的 profile 状态。
@@ -157,7 +219,15 @@ ${backedUp.map((f) => `  @('${f}', '${f.replace(/[\\/]/g, '__')}')`).join(',\n')
   if (Test-Path $src) { Copy-Item $src (Join-Path $profile $pair[0]) -Force; Write-Host "restored $($pair[0])" }
 }
 $plugin = Join-Path $profile 'node_modules\\${PLUGIN_NAME}'
-if (Test-Path $plugin) { Remove-Item $plugin -Recurse -Force; Write-Host 'removed plugin copy' }
+$pluginBackup = Join-Path '${backupDir.replace(/'/g, "''")}' 'plugin'
+if (Test-Path $pluginBackup) {
+  # 安装/卸载前存在旧副本：回滚把它原样放回去（v0.3.0 起）。
+  if (Test-Path $plugin) { Remove-Item $plugin -Recurse -Force }
+  Copy-Item $pluginBackup $plugin -Recurse -Force
+  Write-Host 'restored plugin copy from backup'
+} elseif (Test-Path $plugin) {
+  Remove-Item $plugin -Recurse -Force; Write-Host 'removed plugin copy'
+}
 Write-Host '回滚完成。请重新打开 DeepSeek Harness。'
 `
 )

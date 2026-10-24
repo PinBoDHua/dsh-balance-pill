@@ -263,7 +263,27 @@ function verify(code) {
     ['PLUGIN_VERSION', '插件版本常量'],
     ['configKey', '提醒区分配置变化与真实掉档'],
     ['formatBillingMoment', '跨天起点补日期'],
-    ['RATE_MAX_ELAPSED_MS', '速度基准的 6 小时上限']
+    ['RATE_MAX_ELAPSED_MS', '速度基准的 6 小时上限'],
+    // v0.2.0：最近充值、日均、耗尽时刻与那条死接线的修复。
+    // `recordReading` 尤其值得锚住：readings.js 的写入端在 v1.4 建好后从未被
+    // 调用过（`latestReading()` 恒为 null，看门狗快照的峰谷预估全部静默为空），
+    // 退回这行被删的状态时一切功能看起来正常，只有看门狗的预估悄悄消失。
+    ['data-balance-last-topup', '面板「最近充值」行'],
+    ['lastTopUpFromSamples', '最近充值纯函数'],
+    ['dailyAverage', '近 7 天日均'],
+    ['recordReading', '共享读数槽位的写入端（v0.2.0 接线）'],
+    ['panel.runoutAt', '速度行的预计耗尽后缀'],
+    ['panel.lastTopUp', '「最近充值」词条键'],
+    // v0.3.0：账号级提醒状态机、余额跑道与两处健壮性修复。
+    // `service.balanceAlertState` 尤其值得锚住：状态机退回组件 ref 时，
+    // 「跨会话重置冷却」这个缺陷没有任何单测能抓住（状态机纯函数照常工作），
+    // 只有「切换会话后 30 分钟冷却被重置」这种时序才会露馅。
+    ['service.balanceAlertState', '余额提醒状态机的账号级持有（v0.3.0）'],
+    ['data-balance-runway', '面板「余额跑道」行'],
+    ['panel.runway', '「余额跑道」词条键'],
+    ['runwayOf', '跑道纯函数'],
+    ['FUTURE_SKEW_MS', '未来样本防护（时钟回拨）'],
+    ['pollChoiceList', '轮询选项并集（非档位值兜底）']
   ]) {
     if (!code.includes(marker)) fail(`产物里没有找到 ${label}（${marker}）—— 入口可能没被打进去`)
   }
@@ -271,7 +291,34 @@ function verify(code) {
 
 // -------------------------------------------------------------------- 主流程
 
+/**
+ * 版本一致性校验（v0.3.0 起由构建期强制）：package.json、src/client/version.js、
+ * CHANGELOG.md 顶条目与 lib/index.js 的 `version` 导出必须四处一致。
+ *
+ * 之前这靠一条单测（测试要等构建后才能跑）与人工纪律；版本号出现在面板、
+ * 上报与安装清单里，漏改一处就是「面板显示 v0.3.0、平台统计 0.2.1」这种
+ * 难以察觉的漂移 —— 构建期直接失败比测试晚点发现更好。
+ */
+function assertVersionConsistency() {
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'))
+  const expected = pkg.version
+  const versionJs = readFileSync(join(SRC, 'version.js'), 'utf8').match(/PLUGIN_VERSION\s*=\s*'([^']+)'/)?.[1]
+  const changelog = readFileSync(join(ROOT, 'CHANGELOG.md'), 'utf8').match(/^## (\d+\.\d+\.\d+)\s*$/m)?.[1]
+  const lib = readFileSync(join(ROOT, 'lib', 'index.js'), 'utf8').match(/export const version\s*=\s*'([^']+)'/)?.[1]
+  const places = {
+    'src/client/version.js': versionJs,
+    'CHANGELOG.md（最新条目）': changelog,
+    'lib/index.js': lib
+  }
+  for (const [label, value] of Object.entries(places)) {
+    if (value !== expected) {
+      fail(`版本不一致：package.json 是 ${expected}，${label} 是 ${value ?? '（没有找到版本字面量）'}`)
+    }
+  }
+}
+
 const cssLength = generateStyles()
+assertVersionConsistency()
 const modules = orderModules(ENTRY)
 collectDeclarations(modules)
 const code = assemble(modules)

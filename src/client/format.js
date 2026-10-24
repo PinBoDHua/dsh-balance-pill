@@ -279,7 +279,14 @@ export function formatPeakWindow(window, tzOffsetMinutes, t) {
  * @param t - 本地化函数。
  */
 export function formatCountdown(ms, t) {
-  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return t('duration.unknown')
+  if (typeof ms !== 'number' || !Number.isFinite(ms)) return t('duration.unknown')
+  // v0.2.0：恰好为 0 不再显示「暂时无法估算」。`msUntil*` 都是 `Math.max(0, …)`，
+  // 边界的那一拍会得到 0 —— 旧实现把它与 NaN 一起归进 unknown，于是倒计时在
+  // 跨过边界的前后各有一拍闪出「暂时无法估算」，看起来像算崩了。
+  // 0 意味着「就在此刻」，按剩余 1 秒显示最接近读者的直觉；负数仍视为不可估算
+  // （那不是倒计时，是调用方传错了）。
+  if (ms === 0) return t('duration.seconds', { count: 1 })
+  if (ms < 0) return t('duration.unknown')
   const totalMinutes = Math.floor(ms / 60000)
   if (totalMinutes < 1) return t('duration.seconds', { count: Math.max(1, Math.round(ms / 1000)) })
   const days = Math.floor(totalMinutes / 1440)

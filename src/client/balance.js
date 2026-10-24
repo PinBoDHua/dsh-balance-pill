@@ -19,7 +19,7 @@ import { DEFAULT_SETTINGS } from './settings.js'
  * `x-client-*` 请求头（`@deepseek-ai/dsh-deepseek-account` 的
  * platformClientHeaders），它只用于平台侧统计界面来源，不参与鉴权。
  */
-export const CLIENT_VERSION = '0.2.0-rc.2'
+export const CLIENT_VERSION = '0.2.1'
 
 /** 目标语言键 → 平台需要的 locale 前缀。 */
 export function platformLocale(active) {
