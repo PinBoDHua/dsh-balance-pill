@@ -62,11 +62,27 @@ import { AlertIcon, WalletIcon } from './icons.js'
 import { TrendSparkline } from './sparkline.js'
 import { PLUGIN_VERSION } from './version.js'
 
-/** 面板宽度，与宿主气泡面板一致。 */
-const PANEL_WIDTH = 264
+/**
+ * 面板宽度，与宿主气泡面板一致。
+ *
+ * v0.4 视觉升级从 264 调到 280：面板里全是中文长句（「距下一个空闲时段 1 小时
+ * 0 分钟（18:00 起）」），264 时几乎每行都要折一次，读起来像一段散文；
+ * 280 只多 16px，却能让绝大多数时间/价格行单行排下。
+ */
+const PANEL_WIDTH = 280
 
 /** 面板与徽章之间的空隙。 */
 const PANEL_GAP = 8
+
+/**
+ * 展开面板的 DOM id。
+ *
+ * 存在的理由只有一个：无障碍。触发器用 `aria-controls` 指向它，读屏用户按
+ * 下按钮后能被告知「展开的是哪个区域」；面板自身挂 `tabIndex=-1`，打开时
+ * 由组件把焦点移进去 —— 面板是 portal 到 `body` 末尾的，不主动移焦点的话
+ * 键盘用户根本无法 Tab 到里面的「刷新」与「去充值」。
+ */
+const PANEL_DOM_ID = 'dsh-balance-pill-panel'
 
 /**
  * 订阅一个小型 store 并跟随其变化重渲染。
@@ -1016,7 +1032,11 @@ export function BalancePanel(props) {
           'p',
           { className: 'dbp_meta', key: 'rate', 'data-balance-rate': true },
           t(rateKey, {
-            amount: formatMoneyDelta(-model.rate.spent, summary.currency, options),
+            // v0.4 修：这里此前传的是 `formatMoneyDelta(-spent)`，于是面板上印出
+            // 「近期消耗 -¥0.31」—— 词条本身已经把「消耗」说清楚了，再带一个负号，
+            // 读起来像「减少了 0.31 元」。消耗量是正数，减号属于「余额变化」那个
+            // 语境，不该出现在这句话里。
+            amount: formatMoney(model.rate.spent, summary.currency, options),
             remaining: formatDuration(hours, t)
           }),
           runout === null
@@ -1092,6 +1112,10 @@ export function BalancePanel(props) {
     {
       className: 'dbp_panel',
       role: 'dialog',
+      id: PANEL_DOM_ID,
+      // 面板是 portal 到 body 末尾的非模态气泡：`tabIndex=-1` 让它可以被
+      // 程序化聚焦（打开时把焦点移进来），但不进入自然的 Tab 顺序。
+      tabIndex: -1,
       'aria-label': t('panel.title'),
       'data-balance-panel': true,
       ref: panelRef,
@@ -1151,6 +1175,38 @@ export function BalancePill(props) {
     }
   }, [open])
 
+  /**
+   * 焦点管理（v0.4）。
+   *
+   * 面板 portal 到 `document.body` 末尾，不主动移焦点的话，键盘用户按开徽章后
+   * Tab 只会继续走输入框后面的元素，面板里的「刷新」与「去充值」永远够不着。
+   * 关闭时把焦点还给触发器：面板节点被卸载后，焦点会被浏览器丢回 body，
+   * 用户得从头 Tab 一遍才能回到原来的位置。
+   *
+   * 依赖里带 `position`：首次打开时面板先以 `visibility:hidden` 挂载、量完位置
+   * 才可见，等位置就绪再移焦点，避免聚焦到一个还没定位的节点上。
+   */
+  const triggerRef = React.useRef(null)
+  const focusedOnce = React.useRef(false)
+  React.useEffect(() => {
+    if (open === true) {
+      focusedOnce.current = true
+      if (position === null) return undefined
+      const node = panelRef.current
+      if (node !== null && node !== undefined && typeof node.focus === 'function') {
+        node.focus({ preventScroll: true })
+      }
+      return undefined
+    }
+    if (focusedOnce.current !== true) return undefined
+    focusedOnce.current = false
+    const node = triggerRef.current
+    if (node !== null && node !== undefined && typeof node.focus === 'function') {
+      node.focus({ preventScroll: true })
+    }
+    return undefined
+  }, [open, position])
+
   // 没有账号能力时不留噪音：整枚徽章不出现（诊断走 console）。
   if (phase === 'unsupported') {
     if (globalThis.__DBP_WARNED__ !== true) {
@@ -1163,7 +1219,18 @@ export function BalancePill(props) {
   const level = model?.level ?? 'ok'
   const status = model?.status ?? 'loading'
   const text = pillText(model, settings, locale, t)
-  const label = ariaText(model, settings, locale, t)
+  /**
+   * 触发器的无障碍名（v0.4）。
+   *
+   * 时段徽标是触发器里的一个 `<span>`，而 `<button aria-label>` 会**替换**整个
+   * 子树的可读内容 —— 只给余额描述的话，读屏用户永远听不到「现在贵还是便宜」，
+   * 而那恰恰是这个徽标的另一半信息。因此把时段描述拼到最前面，两件事都保留。
+   */
+  const baseLabel = ariaText(model, settings, locale, t)
+  const label =
+    pricing !== null && settings.showTariff === true
+      ? `${tariffPillAria(pricing, t)} · ${baseLabel}`
+      : baseLabel
   const lowish = level === 'low' || (model !== null && model.summary === null && status === 'failed')
   const Icon = lowish ? AlertIcon : WalletIcon
   /** 余额预估耗尽（24 小时内才有）；拿不到时为 null。 */
@@ -1194,7 +1261,9 @@ export function BalancePill(props) {
       className: 'dbp_trigger',
       'aria-haspopup': 'dialog',
       'aria-expanded': open,
+      'aria-controls': PANEL_DOM_ID,
       'aria-label': label,
+      ref: triggerRef,
       // 耗尽预估作为一个**补充**追加在标题末尾，而不是替换原有内容：
       // title 原本是「账户余额 · ¥3.02」，两件事各说各的。
       title:
