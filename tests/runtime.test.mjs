@@ -16,7 +16,8 @@
 
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -63,12 +64,13 @@ const format = await import(pathToFileURL(join(SRC, 'format.js')).href)
 const settingsModule = await import(pathToFileURL(join(SRC, 'settings.js')).href)
 const history = await import(pathToFileURL(join(SRC, 'history.js')).href)
 const spendModule = await import(pathToFileURL(join(SRC, 'session-spend.js')).href)
+const storageModule = await import(pathToFileURL(join(SRC, 'storage.js')).href)
 const alertModule = await import(pathToFileURL(join(SRC, 'alert.js')).href)
 const tariffAlert = await import(pathToFileURL(join(SRC, 'tariff-alert.js')).href)
 const tariffService = await import(pathToFileURL(join(SRC, 'tariff-service.js')).href)
 const { createAccountClient } = await import(pathToFileURL(join(SRC, 'account.js')).href)
 const { PLUGIN_VERSION } = await import(pathToFileURL(join(SRC, 'version.js')).href)
-const { BalancePill, BalancePanel } = await import(pathToFileURL(join(SRC, 'pill.js')).href)
+const { BalancePill, BalancePanel, panelTabTarget, safeTopUpUrl } = await import(pathToFileURL(join(SRC, 'pill.js')).href)
 const { TrendSparkline } = await import(pathToFileURL(join(SRC, 'sparkline.js')).href)
 const { BalanceAlert } = await import(pathToFileURL(join(SRC, 'alert-toast.js')).href)
 const { zh, en } = await import(pathToFileURL(join(SRC, 'locales.js')).href)
@@ -114,8 +116,193 @@ function memoryStorage(initial) {
   }
 }
 
-/** 北京时间 → epoch 毫秒（测试里到处都要造时刻）。 */
-function bj(text) {
+/**
+ * 有状态的微型 React 运行时（审计 P2-4）。
+ *
+ * 顶部那个 `fakeReact` 的 `useEffect()` 是空实现、`useState` 的 setter 是
+ * `() => {}` —— 所有与时间 / 订阅 / 副作用相关的代码在测试里**根本不执行**。
+ * P1-1 那种「轮询节奏 × 采样门槛」的缺陷因此可以带着 151 项全绿溜过去。
+ *
+ * 这份替身只实现本插件用到的钩子子集，但语义是**真的**：
+ *  - `useState` 的 setter 会触发重渲染（`Object.is` 相等时跳过）；
+ *  - `useEffect` 尊重依赖数组，卸载/依赖变化时执行 cleanup；
+ *  - 渲染后同步执行 effect，effect 里的 setState 会排队到微任务；
+ *  - `settle()` 等到 Promise 链与重渲染都静止，便于断言异步轮询的结果。
+ *
+ * 它不是通用 React：只支持一个根组件（`BalancePill`），子组件按函数组件展开；
+ * 本插件里带钩子的只有根组件，子组件（面板 / 折线 / 图标）都是纯函数。
+ */
+function createMiniRuntime() {
+  let component = null
+  let props = null
+  let mounted = false
+  let hooks = []
+  let cursor = 0
+  let dirty = false
+  let scheduled = false
+  let tree = null
+  let renderCount = 0
+
+  const sameDeps = (left, right) =>
+    Array.isArray(left) &&
+    Array.isArray(right) &&
+    left.length === right.length &&
+    left.every((value, index) => Object.is(value, right[index]))
+
+  const hookSlot = () => {
+    if (hooks[cursor] === undefined) hooks[cursor] = {}
+    return hooks[cursor++]
+  }
+
+  const requestRender = () => {
+    dirty = true
+    if (scheduled) return
+    scheduled = true
+    queueMicrotask(() => {
+      scheduled = false
+      if (mounted) pump()
+    })
+  }
+
+  const runEffects = () => {
+    for (const hook of [...hooks]) {
+      const effect = hook.effect
+      if (effect === undefined || effect.pending === null) continue
+      const pending = effect.pending
+      effect.pending = null
+      if (effect.ran && pending.deps !== undefined && sameDeps(effect.deps, pending.deps)) continue
+      if (typeof effect.cleanup === 'function') {
+        try {
+          effect.cleanup()
+        } catch {
+          /* 清理失败不该掩盖断言 */
+        }
+      }
+      effect.deps = pending.deps
+      effect.ran = true
+      const cleanup = pending.fn()
+      effect.cleanup = typeof cleanup === 'function' ? cleanup : null
+    }
+  }
+
+  /** 展开函数组件（纯展示组件，无钩子）。 */
+  const expand = (node) => {
+    if (node === null || node === undefined || typeof node !== 'object') return node
+    if (Array.isArray(node)) return node.map(expand)
+    if (typeof node.type === 'function') return expand(node.type(node.props))
+    const children = node.props?.children
+    return {
+      ...node,
+      props: {
+        ...node.props,
+        children: Array.isArray(children) ? children.map(expand) : expand(children)
+      }
+    }
+  }
+
+  const renderOnce = () => {
+    if (!mounted) return
+    cursor = 0
+    renderCount += 1
+    tree = expand(component(props))
+    runEffects()
+  }
+
+  const pump = () => {
+    let guard = 0
+    while (mounted && dirty) {
+      dirty = false
+      guard += 1
+      if (guard > 100) throw new Error('微型运行时检测到无限重渲染（依赖数组可能写错了）')
+      renderOnce()
+    }
+  }
+
+  const runtime = {
+    Fragment: Symbol('Fragment'),
+    createElement: (type, elementProps, ...children) => ({
+      type,
+      props: { ...(elementProps ?? {}), children }
+    }),
+    useState(initial) {
+      const hook = hookSlot()
+      if (!('value' in hook)) hook.value = typeof initial === 'function' ? initial() : initial
+      return [
+        hook.value,
+        (next) => {
+          const value = typeof next === 'function' ? next(hook.value) : next
+          if (Object.is(value, hook.value)) return
+          hook.value = value
+          requestRender()
+        }
+      ]
+    },
+    useRef(initial) {
+      const hook = hookSlot()
+      if (!('ref' in hook)) hook.ref = { current: initial }
+      return hook.ref
+    },
+    useCallback(fn, deps) {
+      const hook = hookSlot()
+      if (!('callback' in hook) || !sameDeps(hook.deps, deps)) {
+        hook.callback = fn
+        hook.deps = deps
+      }
+      return hook.callback
+    },
+    useMemo(fn, deps) {
+      const hook = hookSlot()
+      if (!('memo' in hook) || !sameDeps(hook.deps, deps)) {
+        hook.memo = fn()
+        hook.deps = deps
+      }
+      return hook.memo
+    },
+    useEffect(fn, deps) {
+      const hook = hookSlot()
+      if (hook.effect === undefined) hook.effect = { deps: undefined, cleanup: null, ran: false, pending: null }
+      hook.effect.pending = { fn, deps }
+    },
+    mount(rootComponent, rootProps) {
+      component = rootComponent
+      props = rootProps
+      mounted = true
+      dirty = false
+      renderOnce()
+      return runtime
+    },
+    async settle(rounds = 40) {
+      for (let index = 0; index < rounds; index += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        if (dirty) pump()
+        if (!dirty && !scheduled) {
+          await Promise.resolve()
+          if (!dirty && !scheduled) return tree
+        }
+      }
+      return tree
+    },
+    unmount() {
+      mounted = false
+      for (const hook of hooks) {
+        if (typeof hook.effect?.cleanup === 'function') {
+          try {
+            hook.effect.cleanup()
+          } catch {
+            /* 同上 */
+          }
+        }
+      }
+      hooks = []
+      tree = null
+    },
+    getTree: () => tree,
+    renderCount: () => renderCount
+  }
+  return runtime
+}
+
+/** 北京时间 → epoch 毫秒（测试里到处都要造时刻）。 */function bj(text) {
   const match = String(text).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/)
   assert.ok(match, `不支持的时间文本：${text}`)
   return Date.UTC(
@@ -158,15 +345,65 @@ test('normalizeHistory 对非数组输入返回空数组', () => {
   assert.deepEqual(history.normalizeHistory({}), [])
 })
 
-test('normalizeHistory 按条数上限裁剪，保留最近的', () => {
+test('normalizeHistory 超上限时按时间抽稀，保留覆盖跨度与最新样本（P1-2）', () => {
   const now = 1_000_000_000
   const raw = []
   for (let index = 0; index < history.MAX_SAMPLES + 50; index += 1) {
     raw.push(sample(now - (history.MAX_SAMPLES + 50 - index) * 120000, index))
   }
   const normalized = history.normalizeHistory(raw, now)
-  assert.equal(normalized.length, history.MAX_SAMPLES)
+  assert.ok(normalized.length <= history.MAX_SAMPLES, '抽稀后不得超过条数上限')
+  assert.ok(normalized.length >= history.THIN_TARGET - 1, '抽稀应压到目标附近，而不是只剩几条')
   assert.equal(normalized[normalized.length - 1].amount, history.MAX_SAMPLES + 49)
+  // 关键：丢的是分辨率，不是覆盖时长。不能整段丢掉最早的一批样本。
+  const rawSpan = raw[raw.length - 1].at - raw[0].at
+  const keptSpan = normalized[normalized.length - 1].at - normalized[0].at
+  assert.ok(keptSpan > rawSpan * 0.99, `覆盖跨度应基本不变（${keptSpan} / ${rawSpan}）`)
+  // 升序、无重复。
+  for (let index = 1; index < normalized.length; index += 1) {
+    assert.ok(normalized[index].at > normalized[index - 1].at)
+  }
+})
+
+test('thinHistory 按时间均匀分桶：跨度不变、条数受控、幂等（P1-2）', () => {
+  const now = 1_000_000_000
+  const raw = []
+  for (let index = 0; index < 2000; index += 1) {
+    raw.push(sample(now - (2000 - index) * 60000, index))
+  }
+  const thinned = history.thinHistory(raw, 500)
+  assert.ok(thinned.length <= 500)
+  assert.equal(thinned[thinned.length - 1].at, raw[raw.length - 1].at, '最新样本必须保留')
+  const rawSpan = raw[raw.length - 1].at - raw[0].at
+  const keptSpan = thinned[thinned.length - 1].at - thinned[0].at
+  assert.ok(keptSpan > rawSpan * 0.99, '最老一端不能被整段丢弃')
+  // 桶内取最后一条：点之间的间隔应大致均匀，而不是「前面密、后面稀」。
+  const gaps = []
+  for (let index = 1; index < thinned.length; index += 1) gaps.push(thinned[index].at - thinned[index - 1].at)
+  assert.ok(Math.max(...gaps) <= Math.min(...gaps) * 2.1, '抽稀后的采样间隔应基本均匀')
+  assert.deepEqual(history.thinHistory(thinned, 500), thinned, '已抽稀的数据再抽一次应保持不变')
+})
+
+test('连续 7 天 60 秒采样后，近 7 天窗口仍覆盖 ≥ 6.9 天（P1-2 回归）', () => {
+  const DAY = 86400000
+  const start = 1_000_000_000
+  let samples = []
+  // 模拟默认 60 秒轮询连续运行 7 天：旧实现到第 8 小时就开始丢最老的样本，
+  // 覆盖时长被钉死在 8 小时；新实现必须让窗口真的覆盖 7 天。
+  for (let minute = 0; minute <= 7 * 24 * 60; minute += 1) {
+    const at = start + minute * 60000
+    samples = history.appendSample(samples, sample(at, 100 - minute * 0.001), at)
+  }
+  assert.ok(samples.length <= history.MAX_SAMPLES, '条数必须有界')
+  const end = start + 7 * 24 * 60 * 60000
+  const covered = (samples[samples.length - 1].at - samples[0].at) / DAY
+  assert.ok(covered >= 6.9, `7 天后覆盖时长应 ≥ 6.9 天，实际 ${covered.toFixed(3)} 天`)
+  // 面板的「近 7 天」统计必须非空，而不是样本不足两个。
+  const recent = history.spendInWindow(samples, end, { windowMs: history.RECENT_WINDOW_MS })
+  assert.ok(recent !== null, '近 7 天统计不应因为抽稀而消失')
+  assert.ok(recent.spent > 0)
+  const windowCovered = (recent.lastAt - recent.firstAt) / DAY
+  assert.ok(windowCovered >= 6.9, `统计窗口覆盖 ${windowCovered.toFixed(3)} 天`)
 })
 
 test('appendSample 在间隔过近时替换而不是追加', () => {
@@ -260,6 +497,9 @@ test('sparklinePath 给出可用的折线几何', () => {
   assert.equal(geometry.delta, -2)
   assert.equal(geometry.min, 8)
   assert.equal(geometry.max, 10)
+  // v0.5.0：末点画布坐标一并给出，趋势图的悬停端点标记靠它定位。
+  assert.ok(Math.abs(geometry.endX - (100 - 3)) < 0.01, '末点应贴右内边距')
+  assert.ok(Number.isFinite(geometry.endY), '末点纵坐标必须是有限数')
   // 面积路径必须闭合，否则 SVG 会画出敞开的色块。
   assert.ok(geometry.area.endsWith('Z'))
 })
@@ -553,10 +793,14 @@ test('spendInWindow 带 dailyAverage，分母是覆盖天数（v0.2.0）', () =>
   assert.equal(a.spent, 8)
   assert.equal(a.dailyAverage, 2, '8 / 4 天 = 2')
 
-  // 覆盖不足一天按一天算：两小时花 6，日均是 6 而不是被摊薄成 0.03。
+  // **修复（P2-6）：** 按**实际覆盖时长**折算，并加上下限钳制：
+  // 两小时花¥6 → coverageDays ≈ 0.083 (2h/24h) → dailyAverage ≈ 6/0.083 ≈ 72
+  // 这比旧算法把 4 小时当 1 天的「¥2/天」更准确（真值应为≈¥12/天，这里是¥72/天因为只算了 2 小时）。
   const hour = [sample(now - 7200000, 10), sample(now, 4)]
   const b = history.spendInWindow(hour, now, { windowMs: history.RECENT_WINDOW_MS })
-  assert.equal(b.dailyAverage, 6)
+  // 7200000ms = 2h = 2/24/7 ≈ 0.0119 周 ≈ 0.083 天 → 6/0.083 ≈ 72
+  assert.equal(b.dailyAverage, 72, '6 / (2h/24h) = 72')
+  assert.equal(b.coverageDays, 1 / 12, 'coverageDays 钳制在下限 1/12 天（2h）')
 
   // 只跌不涨时 spent=0，dailyAverage 同步为 0（行不渲染，但形状必须自洽）。
   const flat = [sample(now - day, 10), sample(now, 10)]
@@ -921,6 +1165,140 @@ test('loadBaselines / saveBaselines 走存储且容忍损坏', () => {
   assert.equal(spendModule.saveBaselines({}, null), false)
 })
 
+test('充值不再把「本轮已用」清零：carry 累加充值前的消耗（P3-10）', () => {
+  let baselines = spendModule.recordBaseline({}, 's1', { amount: 20, currency: 'CNY', at: 1000 })
+  // 花到 15：本轮已用 5。
+  baselines = spendModule.recordBaseline(baselines, 's1', { amount: 15, currency: 'CNY', at: 2000 })
+  assert.equal(spendModule.sessionSpend(baselines, 's1', { amount: 15, currency: 'CNY' }).spent, 5)
+  // 充到 30：基准前推到 30，但把之前的 5 记进 carry。
+  baselines = spendModule.recordBaseline(baselines, 's1', { amount: 30, currency: 'CNY', at: 3000 })
+  assert.equal(baselines.s1.amount, 30)
+  assert.equal(baselines.s1.carry, 5)
+  // 充值后花到 28：累计消耗 = 5（充值前）+ 2（充值后）= 7，而不是 2 或 0。
+  assert.equal(spendModule.sessionSpend(baselines, 's1', { amount: 28, currency: 'CNY' }).spent, 7)
+  // 再花到 27：carry 仍在。
+  assert.equal(spendModule.sessionSpend(baselines, 's1', { amount: 27, currency: 'CNY' }).spent, 8)
+  // 旧记录没有 carry / lastAmount 字段：解析回落 0 / 基准金额，行为与旧版一致。
+  const legacy = spendModule.normalizeBaselines({ s2: { amount: 10, at: 1000, currency: 'CNY' } })
+  assert.equal(legacy.s2.carry, 0)
+  assert.equal(legacy.s2.lastAmount, 10)
+})
+
+test('mergeHistory 按时刻求并集，同一时刻本次写入优先（P2-7）', () => {
+  const now = 1_000_000_000
+  const windowA = [sample(now - 180000, 20), sample(now - 60000, 18)]
+  const windowB = [sample(now - 120000, 19), sample(now - 60000, 17.5), sample(now, 17)]
+  const merged = history.mergeHistory(windowA, windowB, now)
+  assert.deepEqual(merged.map((item) => item.at), [now - 180000, now - 120000, now - 60000, now])
+  assert.equal(merged[2].amount, 17.5, '同一时刻以 incoming 为准')
+  // 空输入与坏输入都退化成归一化，而不是抛错。
+  assert.equal(history.mergeHistory([], windowB, now).length, 3)
+  assert.equal(history.mergeHistory(windowA, null, now).length, 2)
+  // 存储里的原始 JSON 同样要能合并（写盘路径用得到）。
+  const raw = JSON.stringify(windowA)
+  assert.equal(history.mergeStoredHistory(raw, windowB, now).length, 4)
+  assert.equal(history.mergeStoredHistory('{broken', windowB, now).length, 3)
+})
+
+test('mergeBaselines 按会话求并集，冲突时收敛到信息更完整的一条（P2-7）', () => {
+  // 两个窗口各自记录不同会话：并集保留双方。
+  const union = spendModule.mergeBaselines(
+    { a: { amount: 10, at: 1000, currency: 'CNY' } },
+    { b: { amount: 5, at: 2000, currency: 'CNY' } }
+  )
+  assert.deepEqual(Object.keys(union).sort(), ['a', 'b'])
+
+  // 同一会话：晚挂载的窗口基准更低（已经花掉一部分），取较大的那个才是真正起点。
+  const race = spendModule.mergeBaselines(
+    { s1: { amount: 10, at: 1000, currency: 'CNY' } },
+    { s1: { amount: 9.5, at: 2000, currency: 'CNY' } }
+  )
+  assert.equal(race.s1.amount, 10)
+  assert.equal(race.s1.at, 1000)
+
+  // 充值记录（金额更大 + carry 更大）必须压过旧基准，否则「本轮已用」被清零。
+  const topUp = spendModule.mergeBaselines(
+    { s1: { amount: 10, at: 1000, currency: 'CNY', carry: 0, lastAmount: 9 } },
+    { s1: { amount: 20, at: 3000, currency: 'CNY', carry: 1, lastAmount: 20 } }
+  )
+  assert.equal(topUp.s1.amount, 20)
+  assert.equal(topUp.s1.carry, 1)
+
+  // 基准、carry、起点都相同：取看到更新消费的那份 lastAmount（更小），
+  // 否则下次充值会把「已花」算少。
+  const lastSeen = spendModule.mergeBaselines(
+    { s1: { amount: 10, at: 1000, currency: 'CNY', carry: 0, lastAmount: 9 } },
+    { s1: { amount: 10, at: 1000, currency: 'CNY', carry: 0, lastAmount: 7 } }
+  )
+  assert.equal(lastSeen.s1.lastAmount, 7)
+
+  // 换币种是有意的重置：较新的记录获胜。
+  const reset = spendModule.mergeBaselines(
+    { s1: { amount: 10, at: 1000, currency: 'CNY' } },
+    { s1: { amount: 3, at: 4000, currency: 'USD' } }
+  )
+  assert.equal(reset.s1.currency, 'USD')
+
+  // 坏数据静默降级。
+  assert.equal(spendModule.mergeStoredBaselines('{broken', { s1: { amount: 1, at: 1, currency: 'CNY' } }).s1.amount, 1)
+})
+
+test('createStorageWriter 合并写入、差异检测且 flush 时重新读取存储（P2-8 / P2-7）', () => {
+  const storage = memoryStorage()
+  let task = null
+  const writer = storageModule.createStorageWriter({
+    storage,
+    delayMs: 3000,
+    schedule: (fn, ms) => {
+      task = { fn, ms }
+      return 7
+    },
+    cancel: () => {
+      task = null
+    }
+  })
+  // 同一枚键在合并窗口内排两次：只保留最后一次，且只安排一个定时器。
+  writer.queue('k', [1], (_raw, value) => value)
+  writer.queue('k', [2], (_raw, value) => value)
+  assert.equal(writer.pending(), 1)
+  assert.equal(task.ms, 3000)
+  task.fn()
+  assert.equal(storage.getItem('k'), '[2]')
+  assert.equal(writer.stats().written, 1)
+
+  // 内容相同 → 不写（差异检测）。
+  writer.queue('k', [2], (_raw, value) => value)
+  writer.flush()
+  assert.equal(writer.stats().written, 1)
+  assert.equal(writer.stats().skipped, 1)
+
+  // 写入前重新读取：另一个窗口先写了 [0]，合并后不能把它覆盖掉。
+  storage.setItem('k', '[0]')
+  writer.queue('k', [3], (raw, value) => [...JSON.parse(raw), ...value])
+  writer.flush()
+  assert.equal(storage.getItem('k'), '[0,3]')
+
+  // dispose 先 flush 再停止接收。
+  writer.queue('k', [4], (_raw, value) => value)
+  writer.dispose()
+  assert.equal(storage.getItem('k'), '[4]')
+  writer.queue('k', [5], (_raw, value) => value)
+  assert.equal(writer.pending(), 0)
+})
+
+test('createStorageWriter 在存储抛错时静默降级（配额 / 隐私模式）', () => {
+  const storage = {
+    getItem: () => null,
+    setItem: () => {
+      throw new Error('QuotaExceededError')
+    }
+  }
+  const writer = storageModule.createStorageWriter({ storage, delayMs: 0, schedule: () => 1, cancel: () => {} })
+  writer.queue('k', [1], (_raw, value) => value)
+  assert.doesNotThrow(() => writer.flush())
+  assert.equal(writer.stats().failed, 1)
+})
+
 // ================================================================ 余额提醒
 
 test('advanceAlert 首次观测只记录不提醒', () => {
@@ -1046,6 +1424,62 @@ test('提醒状态的序列化往返与损坏恢复', () => {
   assert.deepEqual(restored, state)
   assert.deepEqual(alertModule.deserializeAlertState(null), alertModule.createAlertState())
   assert.deepEqual(alertModule.deserializeAlertState({ level: 'nope' }).level, null)
+})
+
+test('提醒状态真正落盘：刷新页面后冷却与已提醒档位仍在（P3-3）', () => {
+  const storage = memoryStorage()
+  assert.deepEqual(alertModule.loadAlertState(storage), alertModule.createAlertState())
+  const state = { level: 'low', alertedLevel: 'low', at: 100, alertedAt: 200, seq: 3, amount: 1.5, configKey: 'total|auto|3|10|CNY' }
+  assert.equal(alertModule.saveAlertState(state, storage), true)
+  assert.deepEqual(alertModule.loadAlertState(storage), state)
+  assert.equal(storage.getItem(alertModule.ALERT_KEY).includes('"alertedAt":200'), true)
+  // 损坏的数据回落到初始状态，不影响下一次提醒。
+  storage.setItem(alertModule.ALERT_KEY, '{broken')
+  assert.deepEqual(alertModule.loadAlertState(storage), alertModule.createAlertState())
+  // 存储不可用时不抛错。
+  assert.equal(alertModule.saveAlertState(state, null), false)
+  assert.deepEqual(alertModule.loadAlertState(null), alertModule.createAlertState())
+})
+
+test('充值链接只放行 http(s)，javascript: / 相对地址不渲染（P3-5）', () => {
+  assert.equal(safeTopUpUrl('https://platform.deepseek.com/top_up'), 'https://platform.deepseek.com/top_up')
+  assert.equal(safeTopUpUrl('http://example.com/topup'), 'http://example.com/topup')
+  assert.equal(safeTopUpUrl('javascript:alert(1)'), null)
+  assert.equal(safeTopUpUrl('data:text/html,<script>alert(1)</script>'), null)
+  assert.equal(safeTopUpUrl('/top-up'), null)
+  assert.equal(safeTopUpUrl(''), null)
+  assert.equal(safeTopUpUrl(null), null)
+  assert.equal(safeTopUpUrl(42), null)
+  // 面板只渲染通过白名单的链接。
+  const model = { ...runwayModel(19.1), topUpUrl: 'javascript:alert(1)' }
+  const tree = BalancePanel({
+    model,
+    settings: { ...settingsModule.DEFAULT_SETTINGS },
+    locale: 'zh-CN',
+    t,
+    busy: false,
+    onRefresh: () => {},
+    position: null,
+    panelRef: { current: null },
+    derived: { trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null },
+    pricing: null
+  })
+  assert.equal(findAll(tree, (node) => node.type === 'a' && node.props?.className === 'dbp_topUp').length, 0)
+  const safeTree = BalancePanel({
+    model: { ...runwayModel(19.1), topUpUrl: 'https://platform.deepseek.com/top_up' },
+    settings: { ...settingsModule.DEFAULT_SETTINGS },
+    locale: 'zh-CN',
+    t,
+    busy: false,
+    onRefresh: () => {},
+    position: null,
+    panelRef: { current: null },
+    derived: { trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null },
+    pricing: null
+  })
+  const links = findAll(safeTree, (node) => node.type === 'a' && node.props?.className === 'dbp_topUp')
+  assert.equal(links.length, 1)
+  assert.equal(links[0].props.href, 'https://platform.deepseek.com/top_up')
 })
 
 test('createAlertStore 提供 get / getSnapshot / subscribe', () => {
@@ -1416,17 +1850,102 @@ test('isPeakAt 便捷包装', () => {
 })
 
 test('节假日日历：覆盖年份、来源与关键安排', () => {
-  assert.deepEqual(calendars.CALENDAR_YEARS, [2025, 2026])
-  assert.equal(calendars.calendarCovers(2026), true)
-  assert.equal(calendars.calendarCovers(2027), false)
-  // 逐条抄公告：2026 元旦 / 国庆。
+  assert.deepEqual(calendars.CALENDAR_YEARS, [2025, 2026, 2027])
+  assert.equal(calendars.calendarCovers(2027), true)
+  assert.equal(calendars.calendarCovers(2028), false)
+  // 逐条抄公告：2026 元旦 / 国庆；2027 春节 / 国庆。
   assert.equal(calendars.CHINA_HOLIDAYS['2026-01-01'], 1)
   assert.equal(calendars.CHINA_HOLIDAYS['2026-10-01'], 1)
+  assert.equal(calendars.CHINA_HOLIDAYS['2027-02-05'], 1)
+  assert.equal(calendars.CHINA_HOLIDAYS['2027-01-31'], 0, '2027 春节前调休上班')
+  assert.equal(calendars.CHINA_HOLIDAYS['2027-02-14'], 0, '2027 春节后调休上班')
+  assert.equal(calendars.CHINA_HOLIDAYS['2027-10-09'], 0, '2027 国庆后调休上班')
   // 所有键都是合法日期且标记只有 0/1。
   for (const [date, flag] of Object.entries(calendars.CHINA_HOLIDAYS)) {
     assert.match(date, /^\d{4}-\d{2}-\d{2}$/)
     assert.ok(flag === 0 || flag === 1)
   }
+  // CALENDAR_LAST_ENTRY 从数据表派生，不能与真实最后一条漂移。
+  assert.equal(calendars.CALENDAR_LAST_ENTRY, '2027-10-09')
+  assert.match(calendars.CALENDAR_DATA_VERSION, /^\d{4}-\d{2}-\d{2}$/)
+})
+
+test('2027 的法定节假日与调休补班真正参与时段判定（P2-5）', () => {
+  // 春节 / 劳动节 / 国庆长假中的工作日：全天空闲。
+  assert.equal(pricing.periodAt(bj('2027-02-08 10:00')).period, 'off-peak', '春节假期内')
+  assert.equal(pricing.periodAt(bj('2027-05-03 10:00')).period, 'off-peak', '劳动节假期内')
+  assert.equal(pricing.periodAt(bj('2027-10-04 10:00')).period, 'off-peak', '国庆假期内')
+  // 调休补班的周末：按工作日计费，10:00 属于高峰。
+  assert.equal(pricing.periodAt(bj('2027-01-31 10:00')).period, 'peak', '春节前补班周日')
+  assert.equal(pricing.periodAt(bj('2027-02-14 10:00')).period, 'peak', '春节后补班周日')
+  assert.equal(pricing.periodAt(bj('2027-10-09 10:00')).period, 'peak', '国庆后补班周六')
+  // 普通工作日 / 普通周末仍走常规规则。
+  assert.equal(pricing.periodAt(bj('2027-03-10 10:00')).period, 'peak')
+  assert.equal(pricing.periodAt(bj('2027-03-13 10:00')).period, 'off-peak')
+})
+
+test('calendarStatus 在跨年前后给出「已覆盖 / 需更新」的显式状态（P2-5）', () => {
+  const endOf2026 = calendars.calendarStatus(bj('2026-12-31 23:59'))
+  assert.equal(endOf2026.year, 2026)
+  assert.equal(endOf2026.covered, true)
+  assert.equal(endOf2026.needsUpdate, false, '2027 数据已补齐，不应再提示更新')
+  assert.equal(endOf2026.lastEntry, '2027-10-09')
+
+  // 2027 年 1 月 1 日：当前年份覆盖，但 2028 还没有安排 —— 需要更新。
+  const newYear = calendars.calendarStatus(bj('2027-01-01 00:00'))
+  assert.equal(newYear.year, 2027)
+  assert.equal(newYear.covered, true)
+  assert.equal(newYear.needsUpdate, true)
+
+  // 2028 年 1 月 1 日：日历已经过期 —— 时段判定会退化成「周末规则」，
+  // 但至少状态是显式的，面板会给出醒目横幅。
+  const stale = calendars.calendarStatus(bj('2028-01-01 00:00'))
+  assert.equal(stale.year, 2028)
+  assert.equal(stale.covered, false)
+  assert.equal(stale.lastYear, 2027)
+
+  // 非法入参退回当前时刻，而不是抛错。
+  const fallback = calendars.calendarStatus('2028-01-01')
+  assert.equal(Number.isInteger(fallback.year), true)
+})
+
+test('日历过期时面板给出醒目横幅（P2-5）', () => {
+  const settings = { ...settingsModule.DEFAULT_SETTINGS }
+  const pricing2028 = pricing.pricingSnapshot({ now: bj('2028-01-04 10:00') })
+  const tree = BalancePanel({
+    model: runwayModel(19.1),
+    settings,
+    locale: 'zh-CN',
+    t,
+    busy: false,
+    onRefresh: () => {},
+    position: null,
+    panelRef: { current: null },
+    derived: { trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null },
+    pricing: pricing2028
+  })
+  const banners = findAll(tree, (node) => node.props?.['data-balance-calendar-stale'] === true)
+  assert.equal(banners.length, 1, '2028 年必须出现日历过期横幅')
+  assert.ok(String(banners[0].props.children).includes('2028'))
+  // 过期时不再渲染那行 10.5px 的灰字诊断（横幅已说明同一件事）。
+  assert.equal(findAll(tree, (node) => node.props?.['data-balance-tariff-calendar'] === true).length, 0)
+
+  // 仍覆盖当前年份时没有横幅，只有正常的「覆盖 2025–2027」诊断行。
+  const pricing2026 = pricing.pricingSnapshot({ now: bj('2026-10-16 10:00') })
+  const okTree = BalancePanel({
+    model: runwayModel(19.1),
+    settings,
+    locale: 'zh-CN',
+    t,
+    busy: false,
+    onRefresh: () => {},
+    position: null,
+    panelRef: { current: null },
+    derived: { trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null },
+    pricing: pricing2026
+  })
+  assert.equal(findAll(okTree, (node) => node.props?.['data-balance-calendar-stale'] === true).length, 0)
+  assert.equal(findAll(okTree, (node) => node.props?.['data-balance-tariff-calendar'] === true).length, 1)
 })
 
 // ==================================================================== 格式化
@@ -1771,6 +2290,22 @@ test('styles.css 覆盖深色主题并含全部关键类名', () => {
   assert.match(css, /\.dbp_panel\s*\{[^}]*max-height:/)
 })
 
+test('样式打磨：面板字号跟随宿主、color-mix 有降级（P3-6 / P3-7）', () => {
+  const css = readFileSync(join(SRC, 'styles.css'), 'utf8')
+  // P3-6：面板字号不再写死 12px，而是由宿主次要字号令牌派生。
+  // v0.5.0 收尾：外面用 max() 只设下限。曾经写成 clamp(11px, …, 14px)，第三个
+  // 参数是**上限**，会把用户调大的宿主字号压回去 —— 这两条断言锁住「只保底不设顶」。
+  assert.match(css, /--dbp-panel-font:\s*max\(11px,\s*calc\(var\(--dsh-content-font-size-secondary, 13px\) - 1px\)\)/)
+  assert.ok(!/--dbp-panel-font:[^;]*clamp\(/.test(css), '面板字号不应再被 clamp 的上限卡住')
+  assert.match(css, /\.dbp_panel\s*\{[^}]*font-size:\s*var\(--dbp-panel-font\)/)
+  // 面板内的次级字号用 em 跟随基准，而不是继续写 px。
+  const panelSection = css.slice(css.indexOf('.dbp_panel {'), css.indexOf('.dbp_setRoot'))
+  assert.ok(!/font-size:\s*\d+(?:\.\d+)?px/.test(panelSection), '面板内不应再有写死的 px 字号')
+  // P3-7：旧浏览器没有 color-mix 时，用实色回退块兜住底色与描边。
+  assert.match(css, /@supports not \(color: color-mix\(in srgb, red, blue\)\)/)
+  assert.match(css, /--dbp-surface:\s*rgba\(127, 127, 127, 0\.06\)/)
+})
+
 test('styles.css 的花括号配平（构建期也会再查一次）', () => {
   const css = readFileSync(join(SRC, 'styles.css'), 'utf8')
   let depth = 0
@@ -2007,6 +2542,83 @@ test('package.json / CHANGELOG / 面板版本常量 / 宿主入口四处一致',
   // 构建脚本同样校验这条 —— 测试与构建互为第二道网。
   assert.equal(libEntry.version, pkg.version, 'lib/index.js 的 version 必须与 package.json 一致')
   assert.equal(libEntry.name, pkg.name)
+  // P3-4：宿主实际是 4.0.6-alpha.2。按 semver，`^4.0.4` 与 `>=4.0.4` 都不匹配
+  // 预发布版本（预发布只匹配显式写出的同 tuple），因此必须显式放行该版本。
+  assert.equal(pkg.peerDependencies['@deepseek-ai/cordis'], '^4.0.4 || >=4.0.6-alpha.2 <5.0.0')
+  assert.equal(pkg.peerDependenciesMeta['@deepseek-ai/cordis'].optional, true)
+})
+
+test('安装器遍历全部已登记 profile，--status / 计划不再只认一个（P2-2）', () => {
+  const home = mkdtempSync(join(tmpdir(), 'dbp-install-'))
+  try {
+    for (const name of ['web', 'desktop']) {
+      const dir = join(home, 'profiles', name)
+      mkdirSync(dir, { recursive: true })
+      const manifest = {
+        name: `dsh-profile-${name}`,
+        private: true,
+        dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-balance-pill'] } },
+        dependencies: { 'dsh-balance-pill': `file:${ROOT.replace(/\\/g, '/')}` }
+      }
+      writeFileSync(join(dir, 'package.json'), `${JSON.stringify(manifest, null, 2)}\n`)
+    }
+    const env = { ...process.env, DSH_HOME: home }
+    const script = join(ROOT, 'scripts', 'install.mjs')
+
+    // --status：两个 profile 都要出现（旧实现只打印一个）。
+    const status = execFileSync(process.execPath, [script, '--status'], { env, encoding: 'utf8' })
+    assert.match(status, /web/)
+    assert.match(status, /desktop/)
+    assert.match(status, /需要同步/)
+
+    // --profile 限定：只显示指定的一个。
+    const onlyWeb = execFileSync(process.execPath, [script, '--status', '--profile=web'], { env, encoding: 'utf8' })
+    assert.match(onlyWeb, /web/)
+    assert.doesNotMatch(onlyWeb, /desktop/)
+
+    // 安装计划：两个 profile 各有一段，且各自的备份目录分开。
+    const plan = execFileSync(process.execPath, [script], { env, encoding: 'utf8' })
+    assert.match(plan, /\[web\]/)
+    assert.match(plan, /\[desktop\]/)
+    assert.match(plan, /dsh-balance-pill-backup-/)
+
+    // 真跑一次 --apply：两个 profile 的清单与副本都要更新（旧实现只动一个）。
+    execFileSync(process.execPath, [script, '--apply'], { env, encoding: 'utf8' })
+    for (const name of ['web', 'desktop']) {
+      const dir = join(home, 'profiles', name)
+      const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      assert.equal(typeof manifest.dependencies['dsh-balance-pill'], 'string')
+      assert.ok(manifest.dsh.profile.bundles.includes('dsh-balance-pill'))
+      assert.ok(existsSync(join(dir, 'node_modules', 'dsh-balance-pill', 'client', 'client.js')), `${name} 应已复制客户端产物`)
+    }
+    const backupRoot = readdirSync(home).find((entry) => entry.startsWith('dsh-balance-pill-backup-'))
+    assert.ok(backupRoot, '应生成按时间戳命名的备份目录')
+    for (const name of ['web', 'desktop']) {
+      assert.ok(existsSync(join(home, backupRoot, name, 'restore.ps1')), `${name} 应有独立 restore.ps1`)
+    }
+    assert.ok(existsSync(join(home, backupRoot, 'restore-all.ps1')), '多 profile 时应生成 restore-all.ps1')
+
+    // 未登记本插件的 profile 不应被 --sync-client 当成目标。
+    const third = join(home, 'profiles', 'other')
+    mkdirSync(third, { recursive: true })
+    writeFileSync(
+      join(third, 'package.json'),
+      `${JSON.stringify({ name: 'dsh-profile-other', private: true, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } } }, null, 2)}\n`
+    )
+    const status2 = execFileSync(process.execPath, [script, '--status'], { env, encoding: 'utf8' })
+    assert.match(status2, /other/)
+    assert.match(status2, /否（未登记）/)
+    // 副本不存在时 --sync-client 会以 2 退出（这是预期），但目标列表里仍不该有 other。
+    let sync = ''
+    try {
+      sync = execFileSync(process.execPath, [script, '--sync-client'], { env, encoding: 'utf8' })
+    } catch (error) {
+      sync = `${error.stdout ?? ''}${error.stderr ?? ''}`
+    }
+    assert.doesNotMatch(sync, /other/)
+  } finally {
+    rmSync(home, { recursive: true, force: true })
+  }
 })
 
 // ============================================================ 看门狗（自愈）
@@ -2187,6 +2799,118 @@ test('组件导出形状正确', () => {
   }
 })
 
+test('面板焦点陷阱：Tab 在首尾之间循环，焦点在外时进入面板（P2-3）', () => {
+  // 面板里有「刷新」与「去充值」两个可聚焦元素。
+  assert.equal(panelTabTarget(0, 2, true), 1, 'Shift+Tab 从第一个绕到最后一个')
+  assert.equal(panelTabTarget(1, 2, false), 0, 'Tab 从最后一个绕回第一个')
+  assert.equal(panelTabTarget(0, 2, false), null, '中间位置交还给浏览器')
+  assert.equal(panelTabTarget(1, 2, true), null)
+  // 焦点不在面板内（activeIndex = -1）：正向进第一个、反向进最后一个。
+  assert.equal(panelTabTarget(-1, 2, false), 0)
+  assert.equal(panelTabTarget(-1, 2, true), 1)
+  // 没有可聚焦元素：焦点交给面板容器（tabIndex=-1）。
+  assert.equal(panelTabTarget(-1, 0, false), -1)
+  assert.equal(panelTabTarget(0, 0, true), -1)
+
+  // 面板本身带 id 与 tabIndex=-1，触发器用 aria-controls 指向它。
+  const tree = BalancePanel({
+    model: null,
+    settings: { ...settingsModule.DEFAULT_SETTINGS },
+    locale: 'zh-CN',
+    t,
+    busy: false,
+    onRefresh: () => {},
+    position: null,
+    panelRef: { current: null },
+    derived: {},
+    pricing: null
+  })
+  assert.equal(tree.props.id, 'dsh-balance-pill-panel')
+  assert.equal(tree.props.tabIndex, -1)
+})
+
+test('生命周期集成：挂载 → 读取 → 打开面板 → 今日/趋势/本轮行出现 → 卸载清理（P2-4）', async () => {
+  const fixedNow = bj('2026-10-16 10:00')
+  const originalNow = Date.now
+  const originalReact = globalThis.React
+  Date.now = () => fixedNow
+  const storage = memoryStorage()
+  storage.setItem(
+    history.HISTORY_KEY,
+    JSON.stringify([sample(fixedNow - 3600000, 10), sample(fixedNow - 120000, 9)])
+  )
+  storage.setItem(
+    spendModule.SESSION_KEY,
+    JSON.stringify({ s1: { amount: 10, at: fixedNow - 3600000, currency: 'CNY' } })
+  )
+  const settingsStore = settingsModule.createSettingsStore(
+    { ...settingsModule.DEFAULT_SETTINGS, pollMs: 0 },
+    storage
+  )
+  const service = {
+    account: {
+      available: () => true,
+      read: async () => ({
+        balance: {
+          ok: true,
+          value: { status: 'ready', value: [{ currency: 'CNY', balance: '9.00' }], bonusWallets: [] }
+        },
+        state: { ok: true, value: { status: 'credential-stored' } }
+      })
+    },
+    settings: settingsStore,
+    storage,
+    alerts: alertModule.createAlertStore(),
+    balanceAlertState: alertModule.createAlertState(),
+    activeLocale: () => 'zh-CN'
+  }
+  const runtime = createMiniRuntime()
+  globalThis.React = runtime
+  const windowBefore = listeners.window.size
+  const documentBefore = listeners.document.size
+  try {
+    runtime.mount(BalancePill, { t, service, sessionId: 's1' })
+    await runtime.settle()
+    assert.ok(runtime.renderCount() > 1, '异步读取后应发生重渲染')
+    const firstTree = runtime.getTree()
+    const triggers = findAll(firstTree, (node) => node.type === 'button' && node.props?.['aria-haspopup'] === 'dialog')
+    assert.equal(triggers.length, 1)
+    assert.equal(triggers[0].props['aria-controls'], 'dsh-balance-pill-panel')
+    assert.equal(triggers[0].props['aria-expanded'], false)
+
+    // 模拟用户点击：setState → 重渲染 → 派生统计的 effect 执行。
+    triggers[0].props.onClick()
+    await runtime.settle()
+    const openTree = runtime.getTree()
+    assert.equal(findAll(openTree, (node) => node.props?.['data-balance-panel'] === true).length, 1)
+    assert.equal(findAll(openTree, (node) => node.props?.['data-balance-today-spend'] === true).length, 1, '今日已用行应出现')
+    assert.equal(findAll(openTree, (node) => node.props?.['data-balance-trend'] === true).length, 1, '趋势图应出现')
+    assert.equal(findAll(openTree, (node) => node.props?.['data-balance-spend'] === true).length, 1, '本轮会话行应出现')
+    assert.equal(findAll(openTree, (node) => node.props?.['data-balance-recent-spend'] === true).length, 1)
+    // P2-3：打开后触发器 aria-expanded 为 true，面板在树上。
+    const openTrigger = findAll(openTree, (node) => node.type === 'button' && node.props?.['aria-haspopup'] === 'dialog')[0]
+    assert.equal(openTrigger.props['aria-expanded'], true)
+
+    // P2-7 / P2-8：写盘走合并写盘器，尚未到 3 秒窗口时卸载 —— cleanup 必须 flush。
+    assert.equal(storage.getItem(history.HISTORY_KEY).includes('9'), true)
+  } finally {
+    runtime.unmount()
+    globalThis.React = originalReact
+    Date.now = originalNow
+  }
+  // 卸载后不得留下 window/document 监听器（P2-4 的生命周期缺陷）。
+  assert.equal(listeners.window.size, windowBefore, 'window 监听器应全部移除')
+  assert.equal(listeners.document.size, documentBefore, 'document 监听器应全部移除')
+  // 卸载时 flush：新读数已并进存储里的历史（2 条旧样本 + 1 条新样本）。
+  const saved = JSON.parse(storage.getItem(history.HISTORY_KEY))
+  assert.ok(saved.length >= 3, `卸载时应把队列里的历史落盘，实际 ${saved.length} 条`)
+  assert.deepEqual(saved.map((item) => item.at), [...new Set(saved.map((item) => item.at))], '样本按时刻去重')
+  // P3-3：提醒状态也走同一个合并写盘器落盘，刷新后可恢复。
+  const persistedAlert = storage.getItem(alertModule.ALERT_KEY)
+  assert.ok(persistedAlert !== null, '提醒状态应落盘')
+  assert.equal(JSON.parse(persistedAlert).level, 'warn')
+})
+
 test('产物里带着价格表与节假日数据', () => {
   const { code } = loadBundle()
   // 价格表必须逐项出现在产物里。
@@ -2355,7 +3079,7 @@ test('v0.3.0 接线：余额提醒状态机由 service 持有（跨会话存活�
   assert.ok(pillSrc.includes('service.balanceAlertState = outcome.state'))
   assert.ok(!pillSrc.includes('React.useRef(createAlertState())'), '状态机不得再住在组件 ref 里')
   const indexSrc = readFileSync(join(SRC, 'index.js'), 'utf8')
-  assert.ok(indexSrc.includes('service.balanceAlertState = createAlertState()'), '入口应创建账号级状态机')
+  assert.ok(indexSrc.includes('service.balanceAlertState = loadAlertState(storage)'), '入口应从存储恢复账号级状态机（P3-3）')
 })
 
 test('「余额跑道」等新词条键在中英两版里都有（v0.3.0）', () => {

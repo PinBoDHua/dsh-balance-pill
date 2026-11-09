@@ -23,7 +23,7 @@
 
 import { createAccountClient } from './account.js'
 import { NS, createSettingsStore, loadSettings, resolveStorage } from './settings.js'
-import { createAlertState, createAlertStore } from './alert.js'
+import { createAlertStore, loadAlertState } from './alert.js'
 import { BalanceAlert } from './alert-toast.js'
 import { en, zh } from './locales.js'
 import { BalancePill } from './pill.js'
@@ -106,8 +106,19 @@ export function apply(ctx) {
    * 平台模块之一），已装的第三方插件也直接 require 它。这里仍然做成「拿不到就
    * 退回自带卡片」：提示的内容是「余额快没了」，宁可样式朴素一点也不能整条消失。
    * 通过 `globalThis` 传到渲染组件，避免让组件直接依赖模块解析。
+   *
+   * v0.3.1（审计 P3-8）：这个全局是无主的 —— 卸载 / 热替换后不会清。现在用
+   * `ctx.effect` 的 cleanup 还原成挂载前的值（通常是 undefined），避免旧实例的
+   * Toast 引用泄漏到下一个插件实例。
    */
-  globalThis.__DBP_TOAST__ = resolveToastPrimitive()
+  ctx.effect(() => {
+    const previous = globalThis.__DBP_TOAST__
+    globalThis.__DBP_TOAST__ = resolveToastPrimitive()
+    return () => {
+      if (previous === undefined) delete globalThis.__DBP_TOAST__
+      else globalThis.__DBP_TOAST__ = previous
+    }
+  }, `${NS}: Toast primitive`)
 
   const account = createAccountClient(ctx)
   /**
@@ -151,14 +162,15 @@ export function apply(ctx) {
   // 而徽章所在的槽位是会话作用域的。
   service.tariff = createTariffWatcher({ alerts: service.alerts })
 
-  // 余额跨档提醒的**状态机**（v0.3.0 起住在 service 上，跨会话存活）。
+  // 余额跨档提醒的**状态机**（v0.3.0 起住在 service 上，跨会话存活；
+  // v0.3.1 起从存储恢复，刷新页面不再丢掉「已提醒档位 / 冷却」）。
   //
   // 它此前是徽章组件里的 ref：切换会话会把「已提醒过哪个档位 / 冷却从何时
   // 起算」一起丢掉 —— 30 分钟的全局冷却被会话切换重置，余额在阈值附近时
   // 跨几次会话就可能补出几张重复的卡。提醒本身显示在 root 作用域的浮层上
   // （账号级事件），状态机也该有同样的生命周期。徽章侧惰性初始化同一字段，
   // 便于测试替身不预建它也能工作；生产路径在这里创建，全插件共享一份。
-  service.balanceAlertState = createAlertState()
+  service.balanceAlertState = loadAlertState(storage)
 
   // 挂到输入框下方的状态行末尾（宿主自己的统计胶囊是 order 0，上下文环也是 0，
   // 本条目 order 50 先排在它们之后，再由样式表里的 flex `order:1` 落到最右侧）。

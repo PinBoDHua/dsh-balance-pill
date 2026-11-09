@@ -1,6 +1,6 @@
 {
   "name": "dsh-balance-pill",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "余额徽章 —— 在 DeepSeek Harness 输入框下方状态行末尾显示账户余额，颜色随余额档位变化，并标出当前是高峰还是空闲计费时段（空闲单价为高峰的一半）；面板给出充值/赠金拆分、余额趋势、今日/本周/近 7 天（含日均）与本轮会话消耗、最近一次充值、按日均估算的余额跑道、峰谷预估与余额耗尽预估，掉档或时段切换时浮出提醒（看门狗会从休眠唤醒 / 校时后的时钟跳变中自愈，时段提醒的冷却按方向分账），并可在「设置 → 通用设置」里调整全部行为。",
   "type": "module",
   "main": "lib/index.js",
@@ -21,11 +21,12 @@
     "build": "node scripts/build.mjs",
     "test": "node --test tests/runtime.test.mjs",
     "install:plugin": "node scripts/install.mjs",
+    "check:calendar": "node scripts/check-calendar.mjs",
     "verify": "node scripts/build.mjs && node --test tests/runtime.test.mjs"
   },
   "dependencies": {},
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.4"
+    "@deepseek-ai/cordis": "^4.0.4 || >=4.0.6-alpha.2 <5.0.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {

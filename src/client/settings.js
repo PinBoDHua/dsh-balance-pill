@@ -69,6 +69,15 @@ export function pollChoiceList(currentMs) {
 /** 距离上次读取多久之内不再重复请求（手动刷新与自动刷新共用）。 */
 export const MIN_REFRESH_GAP_MS = 10000
 
+/**
+ * 强制刷新（手动点击 / 切会话）的最小间隔（v0.3.1，审计 P3-9）。
+ *
+ * `refresh(true)` 此前完全绕过 `MIN_REFRESH_GAP_MS`：方向键快速切会话会连发
+ * 读取请求。强制刷新的语义应是「用户明确要求」，不是「无限制」——留 2 秒
+ * 足以让连点/连切合并成一次，又不会让手动刷新显得没反应。
+ */
+export const MIN_FORCE_REFRESH_GAP_MS = 2000
+
 /** 全部默认配置。 */
 export const DEFAULT_SETTINGS = {
   /** 徽章数字口径：可用总额 / 仅充值余额 / 仅赠金余额。 */

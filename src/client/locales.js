@@ -129,6 +129,7 @@ export const zh = {
   'panel.tariff.short': '按当前速度，余额撑不到下一个高峰（还差 {duration}）',
   'panel.tariff.calendar': '节假日日历覆盖 {years} 年',
   'panel.tariff.calendarStale': '节假日日历未覆盖 {year} 年，按常规周末规则判定',
+  'panel.calendarWarn': '⚠ 节假日日历未覆盖 {year} 年（当前数据到 {lastYear} 年）：法定节假日会被当作工作日，峰谷判定、单价与预估都可能出错。请更新 dsh-balance-pill。',
 
   'settings.tariff.title': '计费时段',
   'settings.tariff.description': '高峰时段（北京时间周一至周五 9:00–12:00、14:00–18:00，节假日除外）单价为空闲时段的两倍。',
@@ -270,6 +271,7 @@ export const en = {
   'panel.tariff.short': 'At this pace it falls short of the next peak by {duration}',
   'panel.tariff.calendar': 'Holiday calendar covers {years}',
   'panel.tariff.calendarStale': 'Holiday calendar has no {year} data; weekday/weekend rules apply',
+  'panel.calendarWarn': '⚠ The holiday calendar has no {year} data (latest: {lastYear}). Public holidays will be treated as workdays, so peak/off-peak, prices and estimates may be wrong. Update dsh-balance-pill.',
 
   'settings.tariff.title': 'Billing window',
   'settings.tariff.description': 'Peak hours (Mon–Fri 09:00–12:00 and 14:00–18:00 Beijing time, excluding public holidays) cost double the off-peak rate.',

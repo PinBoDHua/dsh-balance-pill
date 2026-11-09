@@ -50,7 +50,15 @@ export function TrendSparkline(props) {
         })
       },
       React.createElement('path', { className: 'dbp_sparkArea', d: geometry.area }),
-      React.createElement('path', { className: 'dbp_sparkLine', d: geometry.d })
+      React.createElement('path', { className: 'dbp_sparkLine', d: geometry.d }),
+      // 悬停端点标记（v0.5.0）：坐标来自 sparklinePath()，样式在 styles.css 的
+      // `.dbp_sparkEnd`（默认 opacity:0，`:hover` 时显形）。
+      React.createElement('circle', {
+        className: 'dbp_sparkEnd',
+        cx: geometry.endX.toFixed(2),
+        cy: geometry.endY.toFixed(2),
+        r: 2.5
+      })
     ),
     React.createElement(
       'div',

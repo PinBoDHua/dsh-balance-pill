@@ -17,8 +17,31 @@ import { resolveStorage } from './settings.js'
 /** 历史存储键。与设置分开存，避免设置写入把历史覆盖掉。 */
 export const HISTORY_KEY = 'dsh-balance-pill:history'
 
-/** 最多保留的样本条数。 */
-export const MAX_SAMPLES = 480
+/**
+ * 最多保留的样本条数。
+ *
+ * v0.3.1 修（审计 P1-2）：此前是 480，而默认 60 秒轮询下 480 × 60 s = **8 小时**，
+ * 与「近 7 天」窗口自相矛盾 —— 连续开着应用 8 小时后，每追加一条就丢掉最早一条，
+ * 面板上的「近 7 天 / 本周 / 日均 / 跑道 / 最近充值」会**越用越旧、越用越小**，
+ * 而词条仍然写着「近 7 天」。
+ *
+ * 现在提到 960，并在写满时按**时间桶**抽稀（`thinHistory`）：7 天窗口内平均
+ * 约 10.5 分钟一个点，最老的样本不会被优先丢弃。960 条样本序列化后约 100 KB，
+ * 仍远低于 localStorage 的 5 MB 配额；抽稀后的长度只会更小。
+ */
+export const MAX_SAMPLES = 960
+
+/**
+ * 抽稀的目标比例：写满时压到上限的 90%，而不是刚好压到上限。
+ *
+ * 刚好压到 960 的话，下一次轮询又会超限、又要在主线程上重扫 960 条；压到 864
+ * 可以让「抽稀」大约每 1.5 小时才发生一次（60 秒轮询）。桶宽只由时间跨度决定，
+ * 这个比例不影响覆盖时长，只影响主线程上做这件事的频率。
+ */
+export const THIN_TARGET_RATIO = 0.9
+
+/** 抽稀后的目标条数。 */
+export const THIN_TARGET = Math.floor(MAX_SAMPLES * THIN_TARGET_RATIO)
 
 /** 最多保留的历史时长：7 天。 */
 export const MAX_AGE_MS = 7 * 24 * 3600 * 1000
@@ -75,6 +98,53 @@ export function parseSample(raw) {
 }
 
 /**
+ * 按时间桶抽稀样本，把覆盖时长保住，只降低分辨率。
+ *
+ * 这是 P1-2 的核心修复。此前写满时 `slice(-MAX_SAMPLES)` 直接丢最早的一条：
+ * 覆盖时长因此被条数上限钉死（480 × 60 s = 8 小时），「近 7 天」名不符实。
+ * 换成「按时间均匀分桶、每桶保留最后一条」后：
+ *
+ *  - **覆盖优先**：桶宽 = 总跨度 / 目标条数，最老的一端不会被优先丢掉；
+ *  - **形状保真**：每桶取最后一条（不是平均），折线仍然表达「当时剩多少」；
+ *  - **有界**：输出条数 ≤ 目标条数；
+ *  - **幂等**：对已抽稀的数组再调用一次，跨度不变、条数不变。
+ *
+ * 为什么不按「最老三成两两抽稀」（另一种常见写法）：那样反复抽稀会让**最老
+ * 的一小段**越来越稀，等它终于越过 7 天被裁掉时，第二老的样本可能已在 2 天前，
+ * 覆盖时长从 7 天直接掉回 2 天，再花 5 天爬回来。模拟 30 天可以看到这种锯齿。
+ * 按时间均匀分桶没有这个问题：第 8 天起覆盖稳定在 7 天附近。
+ *
+ * @param samples - 已排序、已去重的样本（升序）。
+ * @param target - 目标条数；缺省为 `THIN_TARGET`（上限的 90%）。
+ * @returns 抽稀后的新数组；入参不足目标条数时返回一份浅拷贝。
+ */
+export function thinHistory(samples, target = THIN_TARGET) {
+  if (!Array.isArray(samples)) return []
+  const cap = Number.isFinite(target) ? Math.max(2, Math.floor(target)) : THIN_TARGET
+  if (samples.length <= cap) return [...samples]
+  const first = samples[0].at
+  const last = samples[samples.length - 1].at
+  // 跨度可能为 0（同一毫秒的重复样本已在上游去重，这里只是防御）。
+  const width = Math.max(1, (last - first) / cap)
+  const out = []
+  let bucket = -1
+  let pick = null
+  for (const sample of samples) {
+    const index = Math.min(cap - 1, Math.max(0, Math.floor((sample.at - first) / width)))
+    if (index !== bucket) {
+      if (pick !== null) out.push(pick)
+      bucket = index
+      pick = sample
+    } else {
+      // 同一桶内保留最后一条：桶的右边界最接近「此刻」。
+      pick = sample
+    }
+  }
+  if (pick !== null) out.push(pick)
+  return out
+}
+
+/**
  * 归一化一整份历史：丢弃非法条目、按时间排序、去重、裁剪到上限。
  *
  * 时间乱序在真实场景里会出现（系统时间被调整、多标签页写入），因此这里**排序**
@@ -95,7 +165,17 @@ export function normalizeHistory(raw, now = Date.now()) {
     if (sample.at > now + FUTURE_SKEW_MS) continue
     samples.push(sample)
   }
-  samples.sort((a, b) => a.at - b.at)
+  // 快速路径：appendSample 每次都会调用本函数，而它传进来的数组已经有序。
+  // 960 条样本 × 每次轮询的排序是纯浪费；只在真正乱序（多窗口写入 / 改表）
+  // 时才排序。
+  let ordered = true
+  for (let index = 1; index < samples.length; index += 1) {
+    if (samples[index].at < samples[index - 1].at) {
+      ordered = false
+      break
+    }
+  }
+  if (!ordered) samples.sort((a, b) => a.at - b.at)
   const deduped = []
   for (const sample of samples) {
     const last = deduped[deduped.length - 1]
@@ -105,7 +185,7 @@ export function normalizeHistory(raw, now = Date.now()) {
     }
     deduped.push(sample)
   }
-  return deduped.length > MAX_SAMPLES ? deduped.slice(deduped.length - MAX_SAMPLES) : deduped
+  return deduped.length > MAX_SAMPLES ? thinHistory(deduped, THIN_TARGET) : deduped
 }
 
 /**
@@ -114,15 +194,17 @@ export function normalizeHistory(raw, now = Date.now()) {
  * 规则：
  *  - 距上一枚样本不足 `MIN_SAMPLE_GAP_MS` 时**替换**而不是追加：
  *    手动连点刷新不该在图上打出一串竖直的假尖峰；
+ *  - **保留桶起点时刻**，只更新金额：30 s 轮询不会再把数组长度钉死在 1；
  *  - 币种变了直接丢弃整段历史（不同币种的金额不可比），从这枚样本重新开始；
  *  - 金额与时间都相同时不写入（避免无意义的重渲染与存储写入）。
  *
  * @param samples - 现有样本（升序）。
  * @param sample - 待写入的样本。
  * @param now - 便于测试的当前时间。
+ * @param options - `{minGapMs}`：可选，允许调用方传入更小的最小间隔。
  * @returns 新的样本数组（升序）。
  */
-export function appendSample(samples, sample, now = Date.now()) {
+export function appendSample(samples, sample, now = Date.now(), options) {
   const parsed = parseSample(sample)
   if (parsed === null) return samples
   // 未来时刻的新样本直接拒绝：normalizeHistory 只清**已有**的历史，写坏的时刻
@@ -136,13 +218,19 @@ export function appendSample(samples, sample, now = Date.now()) {
   if (last === undefined) return [parsed]
   if (last.currency !== parsed.currency) return [parsed]
   if (last.amount === parsed.amount && last.at === parsed.at) return current
-  if (parsed.at - last.at < MIN_SAMPLE_GAP_MS) {
+  const minGap = Number.isFinite(options?.minGapMs) ? options.minGapMs : MIN_SAMPLE_GAP_MS
+  if (parsed.at - last.at < minGap) {
+    // **关键修复（P1-1）：** 沿用 last.at（桶起点），而不是 parsed.at。
+    // 只把金额换成最新读数，历史仍按 minGap 的节奏增长，
+    // 30 秒轮询不会再把数组长度钉死在 1。
     const next = current.slice(0, current.length - 1)
-    next.push(parsed)
+    next.push({ ...parsed, at: last.at })
     return next
   }
   const next = [...current, parsed]
-  return next.length > MAX_SAMPLES ? next.slice(next.length - MAX_SAMPLES) : next
+  // v0.3.1（P1-2）：写满时按时间桶抽稀，而不是丢掉最早的一条 ——
+  // 后者会把「近 7 天」的覆盖时长钉死在条数 × 采样间隔上。
+  return next.length > MAX_SAMPLES ? thinHistory(next, THIN_TARGET) : next
 }
 
 /**
@@ -207,7 +295,7 @@ export function downsample(samples, buckets) {
  *
  * @param points - 样本数组（升序）。
  * @param options - `{width, height, padding, minSpan}`。
- * @returns `{d, area, min, max, first, last, delta}`；样本为空时返回 null。
+ * @returns `{d, area, min, max, first, last, delta, points, endX, endY}`；样本为空时返回 null。
  */
 export function sparklinePath(points, options) {
   if (!Array.isArray(points) || points.length === 0) return null
@@ -245,7 +333,12 @@ export function sparklinePath(points, options) {
     first: first.amount,
     last: last.amount,
     delta: last.amount - first.amount,
-    points: points.length
+    points: points.length,
+    // 末点在画布坐标系里的位置（v0.5.0）：趋势图的悬停端点标记要把它落到折线末端。
+    // 不导出的话渲染层只能把 x()/y() 的缩放公式再抄一遍 —— 抄错时折线与圆点会
+    // 悄悄错位，而这种错位在数据平稳时几乎看不出来。
+    endX: x(last.at),
+    endY: y(last.amount)
   }
 }
 
@@ -479,11 +572,14 @@ export function spendInWindow(samples, at, options) {
   if (rawWindow === null || rawWindow <= 0) return null
   const result = spendOver(samples, at, options, (sampleAt) => sampleAt >= atMs - rawWindow && sampleAt <= atMs)
   if (result === null) return null
-  // 日均消耗（v0.2.0）：分母是**覆盖天数**而不是固定 7 —— 窗口里只有两小时样本时，
-  // 除以 7 会把日均压低 84%，读者会以为「其实花得不多」。覆盖不足一天按一天算。
+  // **修复（P2-6）：** 按**实际覆盖时长**折算日均，并加下限与上限钳制：
+  // - 至少按 2 小时（1/12 天）折算，避免分母过小；
+  // - 至多按 7 天折算，避免覆盖不足 7 天时日均被压低；
+  // 这样 4 小时 ¥2 的窗口会得到 ≈¥12/天的日均（真值），而不是¥2/天。
   const DAY_MS = 86400000
-  const coveredDays = Math.max(1, Math.ceil((result.lastAt - result.firstAt) / DAY_MS))
-  return { ...result, dailyAverage: result.spent / coveredDays }
+  const coverageDays = Math.min(7, Math.max(1 / 12, (result.lastAt - result.firstAt) / DAY_MS))
+  const dailyAverage = result.spent / coverageDays
+  return { ...result, dailyAverage, coverageDays }
 }
 
 /**
@@ -563,6 +659,50 @@ export function runwayOf(balance, dailyAverage) {
   const days = amount / average
   if (days > RUNWAY_MAX_DAYS) return null
   return days
+}
+
+/**
+ * 合并两份历史（多窗口 / 多标签页写入，审计 P2-7）。
+ *
+ * 两个窗口各自持有一份内存历史，写盘时如果整份覆写，后写的窗口会覆盖先写的
+ * 窗口采集的样本 —— 表现是「历史缺段」「今日已用突然变小」。这里按样本时刻
+ * 求并集：同一时刻以 `incoming`（本次写入方）为准，其余全部保留，再交给
+ * `normalizeHistory` 做排序、去重、7 天裁剪与容量抽稀。
+ *
+ * @param existing - 存储里已有的样本（调用方负责从 JSON 解析）。
+ * @param incoming - 本次要写入的样本。
+ * @param now - 便于测试的当前时间。
+ * @returns 合并后的样本数组（升序，已归一化）。
+ */
+export function mergeHistory(existing, incoming, now = Date.now()) {
+  const left = Array.isArray(existing) ? existing : []
+  const right = Array.isArray(incoming) ? incoming : []
+  if (left.length === 0) return normalizeHistory(right, now)
+  if (right.length === 0) return normalizeHistory(left, now)
+  // 把一个窗口的样本追加到另一个之后：normalizeHistory 的同毫秒去重规则
+  // 是「后来者覆盖」，因此这里 `incoming` 放在后面即表示本次写入优先。
+  return normalizeHistory([...left, ...right], now)
+}
+
+/**
+ * 合并「存储里的原始 JSON」与本次样本；坏数据静默降级成只保留本次样本。
+ *
+ * 写入前的 read-modify-write 每次都从存储重新读：内存里的 `history.current`
+ * 可能落后于另一个窗口刚写进去的样本。这里把「解析失败」当成「存储为空」，
+ * 历史不是关键路径，绝不让一条坏记录阻塞后续采样。
+ *
+ * @param rawText - `storage.getItem(HISTORY_KEY)` 的原始字符串。
+ * @param incoming - 本次要写入的样本。
+ * @param now - 便于测试的当前时间。
+ * @returns 合并后的样本数组。
+ */
+export function mergeStoredHistory(rawText, incoming, now = Date.now()) {
+  if (typeof rawText !== 'string' || rawText === '') return normalizeHistory(incoming, now)
+  try {
+    return mergeHistory(JSON.parse(rawText), incoming, now)
+  } catch {
+    return normalizeHistory(incoming, now)
+  }
 }
 
 /** 历史存储的读写：任何异常都静默降级成空历史。 */

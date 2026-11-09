@@ -23,17 +23,20 @@
  */
 
 import { rateBaseline, refreshedViewModel, viewModel } from './balance.js'
-import { CALENDAR_FIRST_YEAR, CALENDAR_LAST_YEAR, calendarCovers } from './calendars.js'
-import { MIN_REFRESH_GAP_MS } from './settings.js'
+import { CALENDAR_FIRST_YEAR, CALENDAR_LAST_YEAR, calendarCovers, calendarStatus } from './calendars.js'
+import { MIN_FORCE_REFRESH_GAP_MS, MIN_REFRESH_GAP_MS } from './settings.js'
 // 只借 `priceOf` 读单价：时段快照一律走 `service.tariff.snapshot()`（见下方
 // useTariffSnapshot），这里不自己拼装时段判定，免得出现两份口径。
 import { priceOf } from './pricing.js'
 import {
+  HISTORY_KEY,
   RECENT_WINDOW_MS,
   appendSample,
   downsample,
   lastTopUpFromSamples,
   loadHistory,
+  mergeHistory,
+  mergeStoredHistory,
   runwayOf,
   saveHistory,
   spendInDay,
@@ -42,15 +45,24 @@ import {
   withinWindow
 } from './history.js'
 import { recordReading } from './readings.js'
-import { loadBaselines, pruneBaselines, recordBaseline, saveBaselines, sessionSpend } from './session-spend.js'
-import { advanceAlert, createAlertState } from './alert.js'
+import {
+  SESSION_KEY,
+  loadBaselines,
+  mergeBaselines,
+  mergeStoredBaselines,
+  pruneBaselines,
+  recordBaseline,
+  saveBaselines,
+  sessionSpend
+} from './session-spend.js'
+import { WRITE_COALESCE_MS, createStorageWriter } from './storage.js'
+import { ALERT_KEY, advanceAlert, createAlertState, saveAlertState } from './alert.js'
 import {
   formatAge,
   formatAmount,
   formatBeijingDateTime,
   formatBeijingTime,
   formatBillingMoment,
-  formatClock,
   formatCountdown,
   formatDuration,
   formatMoney,
@@ -83,6 +95,32 @@ const PANEL_GAP = 8
  * 键盘用户根本无法 Tab 到里面的「刷新」与「去充值」。
  */
 const PANEL_DOM_ID = 'dsh-balance-pill-panel'
+
+/**
+ * 计算 Tab / Shift+Tab 在面板内应该落到哪个可聚焦元素（审计 P2-3 补完）。
+ *
+ * 面板是 portal 到 `body` 末尾的非模态气泡，但里面有「刷新」与「去充值」两个
+ * 可聚焦控件。不做焦点陷阱时，从「去充值」继续 Tab 会跳到整页开头 —— 键盘
+ * 用户会以为面板消失了；反向 Shift+Tab 也会漏到面板外。这里把它收敛成纯函数，
+ * 便于单测；DOM 事件处理只负责取 `activeIndex` 与调用 `focus()`。
+ *
+ * @param activeIndex - 当前焦点在 `focusables` 里的下标；不在面板内时为 -1。
+ * @param count - 面板内可聚焦元素个数。
+ * @param shiftKey - 是否按下 Shift（反向 Tab）。
+ * @returns 目标下标；`-1` 表示把焦点交给面板容器；`null` 表示不拦截。
+ */
+export function panelTabTarget(activeIndex, count, shiftKey) {
+  if (!Number.isInteger(count) || count <= 0) return -1
+  const current = Number.isInteger(activeIndex) && activeIndex >= 0 && activeIndex < count ? activeIndex : -1
+  if (shiftKey === true) {
+    // 反向：从第一个（或焦点不在面板内）绕到最后一个。
+    if (current <= 0) return count - 1
+    return null
+  }
+  // 正向：从最后一个（或焦点不在面板内）绕回第一个。
+  if (current === -1 || current === count - 1) return 0
+  return null
+}
 
 /**
  * 订阅一个小型 store 并跟随其变化重渲染。
@@ -198,6 +236,26 @@ function useBalance(service, sessionId, open) {
   const history = React.useRef(null)
   /** 每个会话的基准余额，用于算「本轮花了多少」。 */
   const baselines = React.useRef(null)
+  /**
+   * 合并写盘器（v0.3.1，审计 P2-7 / P2-8）。
+   *
+   * 历史与基准都走它：排队 → 3 秒合并 → flush 时重新读存储、按时间/会话合并
+   * → 内容没变就不写。两个窗口同时开着时，后写的窗口不会再把前一个窗口的
+   * 样本整份覆盖掉。
+   */
+  const writer = React.useRef(null)
+  if (writer.current === null && service.storage !== undefined && service.storage !== null) {
+    writer.current = createStorageWriter({ storage: service.storage, delayMs: WRITE_COALESCE_MS })
+  }
+  /** 另一个窗口写入存储时递增，用来重算派生统计（见 storage 事件监听）。 */
+  const [historyRev, setHistoryRev] = React.useState(0)
+  /**
+   * 提醒状态上一次落盘时的「实质字段」组合（不含 `at`）。
+   *
+   * 每次轮询 `at` 都会前进，若照原样落盘就变成每 60 秒多一次写 —— 正是 P2-8
+   * 要消掉的写放大。只在档位 / 冷却 / 序号真正变化时才排队（审计 P3-3）。
+   */
+  const alertPersistKey = React.useRef('')
   /** 面板打开时才画趋势图，避免无人观看时也做降采样与重渲染。 */
   const [derived, setDerived] = React.useState({ trend: null, spend: null, today: null, week: null, recent: null, lastTopUp: null })
 
@@ -245,8 +303,19 @@ function useBalance(service, sessionId, open) {
       }
 
       // 1) 历史采样：只有真正拿到新读数才写，且写入失败不影响主流程。
-      history.current = appendSample(history.current ?? [], reading)
-      saveHistory(history.current, service.storage)
+      //
+      // v0.3.1（P2-7）：写前先把存储里已有的样本并进来 —— 另一个窗口可能刚
+      // 追加过样本，而 `history.current` 是挂载时读的，直接整份覆写会把它丢掉。
+      history.current = mergeHistory(loadHistory(service.storage), history.current ?? [])
+      history.current = appendSample(history.current, reading)
+      const nextHistory = history.current
+      const storageWriter = writer.current
+      if (storageWriter !== null) {
+        // P2-8：排队合并 + flush 时差异检测，内容没变就不写盘。
+        storageWriter.queue(HISTORY_KEY, nextHistory, (raw) => mergeStoredHistory(raw, nextHistory))
+      } else {
+        saveHistory(nextHistory, service.storage)
+      }
 
       // 1b) 共享读数槽位（v0.2.0 接线）：`readings.js` 的写入端在 v1.4 建好后
       //     一直没接上 —— `latestReading()` 恒为 null，`shell.overlay` 上的时段
@@ -261,9 +330,18 @@ function useBalance(service, sessionId, open) {
       })
 
       // 2) 会话基准：本会话第一次看到余额时记下，之后用「当前 - 基准」算本轮消耗。
-      baselines.current = recordBaseline(baselines.current ?? {}, sessionId, reading)
+      //    v0.3.1（P2-7）：与历史同一条 read-modify-write 纪律 —— 基准表按
+      //    sessionId 是字典，合并语义天然安全；先并入存储里的其他会话，
+      //    避免一个窗口把另一个窗口刚记录的会话基准抹掉。
+      baselines.current = mergeBaselines(loadBaselines(service.storage), baselines.current ?? {})
+      baselines.current = recordBaseline(baselines.current, sessionId, reading)
       baselines.current = pruneBaselines(baselines.current)
-      saveBaselines(baselines.current, service.storage)
+      const nextBaselines = baselines.current
+      if (storageWriter !== null) {
+        storageWriter.queue(SESSION_KEY, nextBaselines, (raw) => mergeStoredBaselines(raw, nextBaselines))
+      } else {
+        saveBaselines(nextBaselines, service.storage)
+      }
 
       // 3) 跨档提醒：状态机只在档位变差且未提醒过时给出 alert。
       //    提醒写进共享 store（不是组件 state）—— 徽章是会话作用域的，
@@ -297,6 +375,18 @@ function useBalance(service, sessionId, open) {
         // `advanceAlert` 是纯函数：新状态必须显式写回，状态机才会记住
         // 「已提醒过哪个档位 / 冷却从何时起算」。
         service.balanceAlertState = outcome.state
+        // v0.3.1（审计 P3-3）：把状态机的**实质变化**持久化 —— 刷新页面后
+        // 「已提醒档位 / 30 分钟冷却」不再丢失。不含每次都前进的 `at`，
+        // 因此不会把 P2-8 刚消掉的写放大带回来。
+        const persistedKey = `${outcome.state.level}|${outcome.state.alertedLevel}|${outcome.state.alertedAt}|${outcome.state.seq}|${outcome.state.configKey}`
+        if (persistedKey !== alertPersistKey.current) {
+          alertPersistKey.current = persistedKey
+          if (storageWriter !== null) {
+            storageWriter.queue(ALERT_KEY, outcome.state, () => outcome.state)
+          } else {
+            saveAlertState(outcome.state, service.storage)
+          }
+        }
         if (outcome.alert !== null) service.alerts.set(outcome.alert)
       }
     },
@@ -312,7 +402,10 @@ function useBalance(service, sessionId, open) {
       if (inflight.current !== null) return inflight.current
       const now = Date.now()
       // 防抖：焦点事件与可见性事件可能在几毫秒内连续到达。
-      if (force !== true && now - lastAt.current < MIN_REFRESH_GAP_MS) return Promise.resolve()
+      // v0.3.1（P3-9）：force 不再等于「无限流」—— 手动刷新与切会话仍受
+      // 2 秒下限约束，连续方向键切会话不会连发读取请求。
+      const minGap = force === true ? MIN_FORCE_REFRESH_GAP_MS : MIN_REFRESH_GAP_MS
+      if (now - lastAt.current < minGap) return Promise.resolve()
       if (alive.current) setSnap((prev) => ({ ...prev, busy: true }))
       const current = service.settings.get()
       const run = service.account
@@ -375,7 +468,12 @@ function useBalance(service, sessionId, open) {
       refresh(false)
     }
     const onVisible = () => {
-      if (document.visibilityState === 'visible') refresh(false)
+      if (document.visibilityState === 'hidden') {
+        // 页面被隐藏 / 关闭前把待写样本落盘：3 秒合并窗口不该吞掉最后一次读数。
+        writer.current?.flush()
+        return
+      }
+      refresh(false)
     }
     // 手动模式（pollMs <= 0）不装定时器，只保留焦点/可见性触发。
     const timer = pollMs > 0
@@ -389,10 +487,43 @@ function useBalance(service, sessionId, open) {
     return () => {
       alive.current = false
       if (timer !== undefined) clearInterval(timer)
+      // 卸载（切换会话 / 关闭面板）时把排队中的样本写完，避免下次挂载读到旧数组。
+      writer.current?.flush()
       window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisible)
     }
   }, [refresh, pollMs])
+
+  /**
+   * 跨窗口同步（v0.3.1，审计 P2-7）。
+   *
+   * `localStorage` 的 `storage` 事件只在**其他**窗口写入时触发，本窗口自己的
+   * 写入不会回环，因此可以安全地「重新加载 + 合并 + 重算派生统计」。
+   * 只认历史与会话两个键；设置有自己的订阅链，不在这里重复处理。
+   */
+  React.useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') return undefined
+    const onStorage = (event) => {
+      try {
+        const key = event?.key
+        if (key !== null && key !== undefined && key !== HISTORY_KEY && key !== SESSION_KEY) return
+        if (key === HISTORY_KEY || key === null || key === undefined) {
+          history.current = mergeHistory(loadHistory(service.storage), history.current ?? [])
+        }
+        if (key === SESSION_KEY || key === null || key === undefined) {
+          baselines.current = mergeBaselines(loadBaselines(service.storage), baselines.current ?? {})
+        }
+        // 递增版本号让派生统计的 effect 重跑：趋势 / 今日 / 本轮消耗都要跟着更新。
+        setHistoryRev((value) => value + 1)
+      } catch {
+        /* 跨窗口同步失败不影响本窗口的余额显示 */
+      }
+    }
+    window.addEventListener('storage', onStorage)
+    return () => {
+      window.removeEventListener('storage', onStorage)
+    }
+  }, [service])
 
   /**
    * 计费时段快照：面板展开时跟着秒级心跳重算（倒计时走字），关着时按 30 秒分桶。
@@ -450,7 +581,7 @@ function useBalance(service, sessionId, open) {
         currency: model?.summary?.currency ?? undefined
       })
     })
-  }, [snap.model, sessionId, snap.model?.format])
+  }, [snap.model, sessionId, snap.model?.format, historyRev])
 
   return {
     model: snap.model,
@@ -472,6 +603,28 @@ function useBalance(service, sessionId, open) {
 function normalizedTrend(samples) {
   if (!Array.isArray(samples) || samples.length < 2) return null
   return downsample(samples, 60)
+}
+
+/**
+ * 充值链接的 scheme 白名单（审计 P3-5）。
+ *
+ * `topUpUrl` 来自宿主返回值。React 会把 `javascript:` 渲染进 `href`（只在控制台
+ * 警告一句），点击即执行脚本 —— 即使宿主当前可信，也不该把「渲染层不校验」当成
+ * 安全边界。这里只放行绝对 `http(s)` 地址；相对地址、空值、非法 URL 一律返回
+ * null，面板不渲染「去充值」入口（少一个按钮，好过多一个可执行链接）。
+ *
+ * @param raw - 宿主返回的充值地址。
+ * @returns 规范化后的 http(s) URL；其余返回 null。
+ */
+export function safeTopUpUrl(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return null
+  try {
+    const url = new URL(raw)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+    return url.href
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -498,11 +651,26 @@ function usePanelPosition(rootRef, open) {
       96,
       Math.round(Math.min(window.innerHeight - PANEL_GAP * 2, rect.top - PANEL_GAP * 2))
     )
-    setStyle({
+    const next = {
       left: `${Math.round(left)}px`,
       bottom: `${Math.round(window.innerHeight - rect.top + PANEL_GAP)}px`,
       width: `${Math.round(width)}px`,
       maxHeight: `${maxHeight}px`
+    }
+    // v0.3.1（审计 P3-1）：监听的是 `scroll` 捕获阶段，面板自身 `overflow-y:auto`
+    // 的滚动也会冒泡到这里。旧实现每次滚动都 `setStyle(新对象)` → 整枚徽章重渲染；
+    // 位置没变时返回旧引用即可让 React 直接 bail out。
+    setStyle((previous) => {
+      if (
+        previous !== null &&
+        previous.left === next.left &&
+        previous.bottom === next.bottom &&
+        previous.width === next.width &&
+        previous.maxHeight === next.maxHeight
+      ) {
+        return previous
+      }
+      return next
     })
   }, [rootRef])
 
@@ -804,17 +972,19 @@ function tariffBlocks(props) {
     )
   }
 
-  // 8. 日历覆盖提示：日历过期意味着「节假日全天空闲」这条会静默失效。
+  // 8. 日历覆盖提示：只在**仍然覆盖当前年份**时给一行诊断信息。
+  //    过期时不再用 10.5px 灰字糊弄（审计 P2-5），改由面板顶部的醒目横幅
+  //    `data-balance-calendar-stale` 承担 —— 两条同时出现只是重复。
   const year = billingYear(pricing.now, tz)
-  blocks.push(
-    React.createElement(
-      'p',
-      { className: 'dbp_tariffMeta', key: 'tariff-calendar', 'data-balance-tariff-calendar': true },
-      calendarCovers(year)
-        ? t('panel.tariff.calendar', { years: `${CALENDAR_FIRST_YEAR}–${CALENDAR_LAST_YEAR}` })
-        : t('panel.tariff.calendarStale', { year })
+  if (calendarCovers(year)) {
+    blocks.push(
+      React.createElement(
+        'p',
+        { className: 'dbp_tariffMeta', key: 'tariff-calendar', 'data-balance-tariff-calendar': true },
+        t('panel.tariff.calendar', { years: `${CALENDAR_FIRST_YEAR}–${CALENDAR_LAST_YEAR}` })
+      )
     )
-  )
+  }
 
   return blocks
 }
@@ -838,6 +1008,12 @@ export function BalancePanel(props) {
   const recent = derived?.recent ?? null
   const lastTopUp = derived?.lastTopUp ?? null
   const trend = derived?.trend ?? null
+  /**
+   * 日历覆盖状态（审计 P2-5）：面板打开时用时段快照里的 `now`，拿不到时段服务
+   * 时退回本机时刻。过期时必须给**醒目横幅** —— 此前只有一行 10.5 px 灰字，
+   * 而「节假日被当成工作日」会让峰谷、单价、倒计时、节省预估全部算错。
+   */
+  const calendar = calendarStatus(pricing?.now ?? Date.now())
   const children = [
     React.createElement(
       'div',
@@ -870,6 +1046,23 @@ export function BalancePanel(props) {
         'p',
         { className: 'dbp_stale', key: 'stale', role: 'status', 'data-balance-stale': true },
         t('panel.stale', { age: formatAge(model.at, t) })
+      )
+    )
+  }
+
+  // 日历过期横幅（P2-5）：放在最上面一层，不依赖是否已读到余额 ——
+  // 时段判定是全天的，没读到余额时它同样可能给出错误的价格与倒计时。
+  if (calendar.covered !== true) {
+    children.push(
+      React.createElement(
+        'p',
+        {
+          className: 'dbp_calendarWarn',
+          key: 'calendar-stale',
+          role: 'status',
+          'data-balance-calendar-stale': true
+        },
+        t('panel.calendarWarn', { year: calendar.year, lastYear: calendar.lastYear })
       )
     )
   }
@@ -1077,7 +1270,9 @@ export function BalancePanel(props) {
       { className: 'dbp_meta', key: 'updated', 'data-balance-updated': true },
       model === null || model.at === null
         ? t('age.never')
-        : t('panel.updated', { time: formatClock(model.at), age: formatAge(model.at, t) })
+        // v0.3.1（审计 P3-2）：面板里其他时刻都是**北京时间**（计费口径），
+        // 「更新于」此前却用本地时区 —— 非 +08:00 的机器会同时看到两套钟。
+        : t('panel.updated', { time: formatBeijingTime(model.at), age: formatAge(model.at, t) })
     ),
     React.createElement(
       'p',
@@ -1097,11 +1292,12 @@ export function BalancePanel(props) {
     React.createElement('p', { className: 'dbp_meta', key: 'settings-hint' }, t('panel.settingsHint'))
   )
 
-  if (model !== null && model.topUpUrl !== null) {
+  const topUpHref = safeTopUpUrl(model?.topUpUrl)
+  if (topUpHref !== null) {
     children.push(
       React.createElement(
         'a',
-        { className: 'dbp_topUp', key: 'topup', href: model.topUpUrl, target: '_blank', rel: 'noreferrer noopener' },
+        { className: 'dbp_topUp', key: 'topup', href: topUpHref, target: '_blank', rel: 'noreferrer noopener' },
         t('panel.topUp')
       )
     )
@@ -1158,8 +1354,40 @@ export function BalancePill(props) {
 
   React.useEffect(() => {
     if (open !== true) return undefined
+    /**
+     * 键盘：Esc 关闭；Tab 在面板内循环（v0.3.1，审计 P2-3）。
+     *
+     * 之前只处理 Esc —— 从「去充值」继续 Tab 会跳到整页开头，键盘用户会以为
+     * 面板被关掉了。这里把面板内的 `button / a / [tabindex]` 收成一列，按
+     * `panelTabTarget` 的判断在首尾之间绕回；焦点不在面板内时，正向 Tab 进入
+     * 第一个、反向 Tab 进入最后一个。
+     */
     const onKey = (event) => {
-      if (event.key === 'Escape') setOpen(false)
+      if (event.key === 'Escape') {
+        setOpen(false)
+        return
+      }
+      if (event.key !== 'Tab') return
+      const panel = panelRef.current
+      if (panel === null || panel === undefined || typeof panel.querySelectorAll !== 'function') return
+      let focusables
+      try {
+        focusables = [...panel.querySelectorAll('button:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])')]
+      } catch {
+        return
+      }
+      const active = typeof document !== 'undefined' ? document.activeElement : null
+      const target = panelTabTarget(focusables.indexOf(active), focusables.length, event.shiftKey === true)
+      if (target === null) return
+      if (typeof event.preventDefault === 'function') event.preventDefault()
+      if (target === -1) {
+        if (typeof panel.focus === 'function') panel.focus({ preventScroll: true })
+        return
+      }
+      const node = focusables[target]
+      if (node !== null && node !== undefined && typeof node.focus === 'function') {
+        node.focus({ preventScroll: true })
+      }
     }
     const onDown = (event) => {
       const target = event.target
@@ -1208,9 +1436,11 @@ export function BalancePill(props) {
   }, [open, position])
 
   // 没有账号能力时不留噪音：整枚徽章不出现（诊断走 console）。
+  // v0.3.1（审计 P3-8）：告警去重标记挂在 `service` 上而不是 `globalThis` ——
+  // 后者在卸载 / 热替换后不会被清，会污染下一个插件实例的诊断状态。
   if (phase === 'unsupported') {
-    if (globalThis.__DBP_WARNED__ !== true) {
-      globalThis.__DBP_WARNED__ = true
+    if (service.unsupportedWarned !== true) {
+      service.unsupportedWarned = true
       console.warn('[dsh-balance-pill] remote.account 未挂载，余额徽章已停用')
     }
     return null

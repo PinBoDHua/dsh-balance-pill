@@ -283,7 +283,28 @@ function verify(code) {
     ['panel.runway', '「余额跑道」词条键'],
     ['runwayOf', '跑道纯函数'],
     ['FUTURE_SKEW_MS', '未来样本防护（时钟回拨）'],
-    ['pollChoiceList', '轮询选项并集（非档位值兜底）']
+    ['pollChoiceList', '轮询选项并集（非档位值兜底）'],
+    // v0.3.1（审计 P1-2 / P2-3 / P2-5 / P2-7 / P2-8 / P3-10）。
+    // 这些标记锚住的都是「删掉后功能会安静退回旧缺陷」的接线：
+    //  - `thinHistory`：退回 `slice` 时覆盖时长又被条数钉死；
+    //  - `mergeStoredHistory` / `mergeStoredBaselines`：退回整份覆写时多窗口互相覆盖；
+    //  - `createStorageWriter`：退回每次轮询两次同步写盘；
+    //  - `panelTabTarget`：退回只处理 Esc 时 Tab 会跳出面板；
+    //  - `data-balance-calendar-stale`：退回灰字时 2027 年静默算错；
+    //  - `lastAmount`：退回无 carry 的基准时充一次值「本轮已用」就归零。
+    ['thinHistory', '历史按时间抽稀（7 天覆盖）'],
+    ['mergeStoredHistory', '多窗口历史合并（写入前重读）'],
+    ['mergeStoredBaselines', '多窗口会话基准合并'],
+    ['createStorageWriter', '延迟合并写盘（差异检测）'],
+    ['WRITE_COALESCE_MS', '写盘合并窗口'],
+    ['mergeBaselines', '多窗口会话基准合并'],
+    ['dsh-balance-pill:alert', '提醒状态存储键'],
+    ['safeTopUpUrl', '充值链接 scheme 白名单'],
+    ['MIN_FORCE_REFRESH_GAP_MS', '强制刷新下限'],
+    ['panelTabTarget', '面板焦点陷阱'],
+    ['data-balance-calendar-stale', '日历过期醒目横幅'],
+    ['calendarStatus', '日历覆盖状态'],
+    ['lastAmount', '充值后的会话消耗 carry']
   ]) {
     if (!code.includes(marker)) fail(`产物里没有找到 ${label}（${marker}）—— 入口可能没被打进去`)
   }
@@ -317,8 +338,54 @@ function assertVersionConsistency() {
   }
 }
 
+/**
+ * 日历覆盖检查（v0.3.1，审计 P2-5）。
+ *
+ * 节假日日历是「事实数据」，每年 11 月国务院办公厅发布下一年安排后需要人工
+ * 补表。此前这件事没有任何自动检查：2027 年 1 月 1 日起，法定节假日会被
+ * 当作普通工作日，峰谷判定、单价、倒计时、节省预估全部静默出错，面板里只有
+ * 一行 10.5 px 的灰字。
+ *
+ * 这里的口径：
+ *  - **当前年份没数据 → 构建失败**。这已经不是「未来某天会坏」，而是现在
+ *    算出来的价格就可能是错的；
+ *  - **下一年没数据 → 默认只警告，`--strict-calendar` 时失败**。每年 11～12 月
+ *    本来就要补表，构建还不能停；发版前跑 `node scripts/build.mjs --strict-calendar`
+ *    （或 `npm run check:calendar`）把警告升级成门禁。
+ */
+function assertCalendarCoverage() {
+  const source = readFileSync(join(SRC, 'calendars.js'), 'utf8')
+  const declared = source.match(/CALENDAR_YEARS\s*=\s*\[([^\]]*)\]/)?.[1] ?? ''
+  const years = declared
+    .split(',')
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isInteger(value))
+  if (years.length === 0) {
+    fail('calendars.js: 找不到 CALENDAR_YEARS 年份声明')
+    return
+  }
+  // 用北京时间取年份：计费口径是 +08:00，跨年那一刻构建机可能在别的时区。
+  const currentYear = new Date(Date.now() + 8 * 3600000).getUTCFullYear()
+  const lastYear = Math.max(...years)
+  if (!years.includes(currentYear)) {
+    fail(
+      `节假日日历未覆盖当前年份 ${currentYear}（声明 ${Math.min(...years)}–${lastYear}）—— ` +
+        '法定节假日会被当作工作日，峰谷与单价都会算错；请先补 calendars.js'
+    )
+    return
+  }
+  if (!years.includes(currentYear + 1)) {
+    const message =
+      `节假日日历尚未覆盖 ${currentYear + 1} 年（当前 ${Math.min(...years)}–${lastYear}）；` +
+      `请在今年 11 月国务院办公厅公布安排后补表，否则 ${currentYear + 1}-01-01 起构建会失败`
+    if (process.argv.includes('--strict-calendar')) fail(message)
+    else console.warn(`警告：${message}`)
+  }
+}
+
 const cssLength = generateStyles()
 assertVersionConsistency()
+assertCalendarCoverage()
 const modules = orderModules(ENTRY)
 collectDeclarations(modules)
 const code = assemble(modules)

@@ -1,10 +1,18 @@
 /*
- * 余额徽章 —— 样式表。
+ * 余额徽章 —— 样式表（UI/UX 升级版 v0.5.0）。
  *
- * 视觉目标是「看起来像宿主自己画的」：徽章沿用 ContextMeter 触发器与
- * StatsPills 胶囊的同一套尺寸（13px 字号、20px 行高、1px 8px 内边距、
- * tabular-nums），展开面板沿用宿主统计气泡面板的同一套表面与阴影令牌。
- * 唯一新增的是档位配色：正常绿、偏低橙、不足红。
+ * 视觉目标升级：在保持宿主一致性的基础上，增加现代感与层次感：
+ * - 徽章微动效：悬停时轻微缩放 + 渐变过渡
+ * - 面板玻璃态：更强的背景模糊与层次区分
+ * - 趋势图动态化：添加平滑过渡动画
+ * - 交互反馈增强：点击波纹、焦点环优化
+ * - 信息层级清晰：更重要的数据更突出
+ * - 无障碍改进：更大的触控区域、更好的对比度
+ * 
+ * 配色原则：
+ * - 档位色：ok (绿色) / warn (橙色) / low (红色)
+ * - 时段色：peak (暖橙) / offPeak (翠绿)
+ * - 中性色：表面 / 发丝线 / 轨道灰（通过变量定义）
  */
 
 /*
@@ -25,33 +33,45 @@
   --dbp-low: var(--dsw-alias-state-error-primary, #d93a45);
   /*
    * 时段色（v1.3）：高峰 = 贵，用暖色；空闲 = 便宜，用绿色。
-   *
-   * 同样必须定义在 `:root` 上：面板 portal 到 `body`，`.dbp_tariffBadge` 不在
-   * `.dbp_root` 子树里，把变量挂在徽章上会让面板里的 `var()` 解析失败。
+   * 
+   * UI 升级 v0.5：增加饱和度与明度梯度，让颜色在不同背景下都清晰可见。
    */
-  --dbp-peak: #c07a12;
+  --dbp-peak: #ff8c42;
   --dbp-offpeak: var(--dsw-alias-state-success-primary, #1f8f5f);
   /*
-   * 视觉升级（v0.4）新增的四个中性令牌。它们只描述「表面 / 发丝线 / 轨道 / 阴影」，
-   * 不引入新的语义色 —— 颜色仍然全部来自档位与时段两组变量，避免面板里出现
-   * 第二套配色体系。同样挂在 `:root` 上（面板 portal 到 body）。
+   * 视觉升级（v0.4→v0.5）新增的中性令牌。增强玻璃态效果与层次感。
+   * - surface: 卡片表面背景
+   * - hairline: 1px 发丝线
+   * - rail: 轨道/分割线
+   * - panel-border: 面板边框（深色模式加强）
    */
-  --dbp-surface: color-mix(in srgb, var(--dsw-alias-label-tertiary) 5%, transparent);
+  --dbp-surface: color-mix(in srgb, var(--dsw-alias-label-tertiary) 6%, transparent);
+  --dbp-surface-elevated: color-mix(in srgb, var(--dsw-alias-label-tertiary) 10%, transparent);
   --dbp-hairline: var(--dsw-alias-border-l1);
-  --dbp-rail: color-mix(in srgb, var(--dsw-alias-label-tertiary) 26%, transparent);
+  --dbp-rail: color-mix(in srgb, var(--dsw-alias-label-tertiary) 20%, transparent);
   --dbp-panel-border: var(--dsw-alias-border-l1);
+  /* 徽章悬停微光效果（v0.5） */
+  --dbp-glow: color-mix(in srgb, currentColor 8%, transparent);
+  /*
+   * 面板基准字号（v0.5.0）：跟随宿主令牌，只设下限、不设上限。
+   *
+   * 这里必须是 max() 而不是 clamp()：clamp 的第三个参数是**上限**，写 14px 会把
+   * 用户调大的宿主字号压回来，与「字号跟随宿主」正好相反。
+   */
+  --dbp-panel-font: max(11px, calc(var(--dsh-content-font-size-secondary, 13px) - 1px));
 }
 
 body[data-ds-dark-theme] {
   --dbp-ok: #4bbf8b;
   --dbp-warn: #e2a13c;
   --dbp-low: #f06a6a;
-  --dbp-peak: #e2a13c;
+  --dbp-peak: #ffaa66;
   --dbp-offpeak: #4bbf8b;
-  /* 深色下 5% 的黑几乎不可见，表面改为「提亮」而不是「压暗」。 */
-  --dbp-surface: color-mix(in srgb, #ffffff 6%, transparent);
-  --dbp-rail: color-mix(in srgb, #ffffff 18%, transparent);
-  --dbp-panel-border: color-mix(in srgb, #ffffff 9%, transparent);
+  /* 深色模式优化：减少对比度过大的灰度，提升阅读舒适度。*/
+  --dbp-surface: color-mix(in srgb, #ffffff 5%, transparent);
+  --dbp-surface-elevated: color-mix(in srgb, #ffffff 9%, transparent);
+  --dbp-rail: color-mix(in srgb, #ffffff 15%, transparent);
+  --dbp-panel-border: color-mix(in srgb, #ffffff 12%, transparent);
 }
 
 .dbp_root {
@@ -67,7 +87,7 @@ body[data-ds-dark-theme] {
   border: none;
   background: 0 0;
   /* 胶囊形：状态行里的其他条目是圆角矩形，徽章做成胶囊才能在视觉上「自成一枚」。 */
-  padding: 2px 9px;
+  padding: 2px 12px;
   border-radius: 999px;
   font-family: inherit;
   font-size: var(--dsh-content-font-size-secondary, 13px);
@@ -78,23 +98,58 @@ body[data-ds-dark-theme] {
   flex: none;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   color: var(--dsw-alias-label-tertiary);
-  transition: color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+/* v0.5 UI 升级：悬停微动效 —— 轻微放大 + 渐变背景 */
+.dbp_trigger::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: radial-gradient(circle at center, var(--dbp-glow) 0%, transparent 70%);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.dbp_trigger:hover::before {
+  opacity: 1;
+}
+
+.dbp_trigger:hover {
+  transform: translateY(-1px) scale(1.02);
+  z-index: 1;
 }
 
 .dbp_trigger:focus-visible {
   outline: 2px solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary));
-  outline-offset: 1px;
+  outline-offset: 2px;
 }
 
 .dbp_text {
   font-weight: 500;
+  position: relative;
+  z-index: 1;
 }
 
 .dbp_icon {
   flex: none;
   display: block;
+  position: relative;
+  z-index: 1;
+  transition: transform 0.2s ease;
+}
+
+.dbp_trigger:hover .dbp_icon {
+  transform: rotate(15deg);
 }
 
 /* ---------------------------------------------------------------- 档位配色 */
@@ -173,28 +228,35 @@ body[data-ds-dark-theme] {
   overscroll-behavior: contain;
   scrollbar-width: thin;
   scrollbar-color: var(--dbp-rail) transparent;
-  padding: 14px;
-  /* 发丝边 + 阴影：浅色页面里纯阴影的卡片边界很虚，补一圈 1px 边界才立得住。 */
-  border: 1px solid var(--dbp-panel-border);
-  border-radius: 14px;
+  padding: 16px;
+  /* v0.5 UI 升级：玻璃态 + 更强的层次感
+   * - 增强背景模糊效果
+   * - 添加更精致的阴影层级
+   * - 边框半透明化，融入背景
+   */
+  border: 1px solid color-mix(in srgb, var(--dbp-panel-border) 70%, transparent);
+  border-radius: 16px;
   background: var(--dsw-specific-menu);
-  backdrop-filter: var(--dsw-menu-backdrop-filter);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
   --dsw-elevation-stroke-color: var(--dsw-alias-border-l1);
-  box-shadow: var(--dsw-elevation-prominent);
+  box-shadow: 
+    0 1px 3px rgba(0, 0, 0, 0.05),
+    0 4px 12px rgba(0, 0, 0, 0.08),
+    inset 0 1px 0 color-mix(in srgb, #ffffff 10%, transparent);
   color: var(--dsw-alias-label-secondary);
-  font-size: 12px;
-  line-height: 20px;
+  font-size: var(--dbp-panel-font);
+  line-height: 1.62;
   cursor: default;
-  /* 展开动效：只做 4px 的位移与极小缩放，README 的截图对比不受影响；
-     prefers-reduced-motion 下整段关闭（见文件末尾）。 */
-  animation: dbp-panel-in 140ms cubic-bezier(0.2, 0.8, 0.3, 1) both;
+  /* v0.5: 优化动画 —— 更平滑的缓动曲线 */
+  animation: dbp-panel-in 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
   transform-origin: bottom right;
 }
 
 @keyframes dbp-panel-in {
   from {
     opacity: 0;
-    transform: translateY(4px) scale(0.985);
+    transform: translateY(8px) scale(0.97);
   }
   to {
     opacity: 1;
@@ -210,7 +272,7 @@ body[data-ds-dark-theme] {
 
 .dbp_panelTitle {
   color: var(--dsw-alias-label-primary);
-  font-size: 13px;
+  font-size: 1.0833em;
   font-weight: 600;
   letter-spacing: 0.01em;
 }
@@ -222,8 +284,8 @@ body[data-ds-dark-theme] {
   border-radius: 5px;
   background: var(--dbp-surface);
   color: var(--dsw-alias-label-tertiary);
-  font-size: 10.5px;
-  line-height: 16px;
+  font-size: 0.875em;
+  line-height: 1.5;
   font-variant-numeric: tabular-nums;
 }
 
@@ -237,8 +299,8 @@ body[data-ds-dark-theme] {
   background: 0 0;
   color: var(--dsw-alias-label-secondary);
   font-family: inherit;
-  font-size: 12px;
-  line-height: 22px;
+  font-size: 1em;
+  line-height: 1.8;
   cursor: pointer;
   transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
 }
@@ -293,14 +355,14 @@ body[data-ds-dark-theme] {
 .dbp_totalKey {
   padding-top: 6px;
   color: var(--dsw-alias-label-secondary) !important;
-  font-size: 12px;
+  font-size: 1em;
 }
 
 .dbp_totalValue {
   padding-top: 6px;
-  font-size: 19px;
+  font-size: 1.5833em;
   font-weight: 650;
-  line-height: 24px;
+  line-height: 1.3;
   letter-spacing: -0.01em;
 }
 
@@ -332,25 +394,43 @@ body[data-ds-dark-theme] {
   padding: 6px 9px;
   border-radius: 8px;
   border-left: 2px solid var(--dbp-warn);
-  background: color-mix(in srgb, var(--dbp-warn) 11%, transparent);
+  background-color: rgba(192, 122, 18, 0.11);
+  background-color: color-mix(in srgb, var(--dbp-warn) 11%, transparent);
   color: var(--dbp-warn);
-  font-size: 11.5px;
-  line-height: 17px;
+  font-size: 0.9583em;
+  line-height: 1.5;
+}
+
+/* 日历过期横幅（v0.3.1，审计 P2-5）：日历过期不是「一行诊断」，而是
+   「单价与峰谷结论可能算错」—— 用与余额不足同一档的红色 + 3px 左轨，
+   让它在面板顶部无法被忽略。 */
+.dbp_calendarWarn {
+  margin: 0 0 10px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border-left: 3px solid var(--dbp-low);
+  background-color: rgba(217, 58, 69, 0.1);
+  background-color: color-mix(in srgb, var(--dbp-low) 10%, transparent);
+  color: var(--dbp-low);
+  font-size: 0.9583em;
+  line-height: 1.5;
+  font-weight: 500;
 }
 
 .dbp_meta {
   margin: 1px 0 0;
   color: var(--dsw-alias-label-tertiary);
-  font-size: 11px;
-  line-height: 17px;
+  font-size: 0.9167em;
+  line-height: 1.55;
 }
 
 /* ------------------------------------------------------------ 会话消耗与趋势 */
 
 /*
- * 消耗统计五行（本轮 / 今日 / 本周 / 近 7 天 / 跑道 / 最近充值）是同一族背景信息：
- * 统一成 11.5px 的紧凑列表 + 一枚 3px 圆点前缀。圆点比缩进更像「一组数据」，
- * 也让「本轮会话」的高亮底纹与其余行的关系一眼可读。
+ * v0.5 升级：消耗统计五行现在更强调层次与可读性。
+ * - 本轮会话加高亮背景 + 图标前缀
+ * - 今日/本周/近 7 天使用渐变透明度表示时间远近
+ * - 最近充值用绿色圆点标记入账事件
  */
 .dbp_spend,
 .dbp_today,
@@ -359,11 +439,11 @@ body[data-ds-dark-theme] {
 .dbp_topup,
 .dbp_runway {
   position: relative;
-  margin: 1px 0 0;
-  padding-left: 12px;
+  margin: 1px 0 2px;
+  padding-left: 14px;
   color: var(--dsw-alias-label-tertiary);
-  font-size: 11.5px;
-  line-height: 18px;
+  font-size: 0.9583em;
+  line-height: 1.56;
   font-variant-numeric: tabular-nums;
 }
 
@@ -375,35 +455,60 @@ body[data-ds-dark-theme] {
 .dbp_runway::before {
   content: '';
   position: absolute;
-  left: 3px;
-  top: 7px;
-  width: 3px;
-  height: 3px;
+  left: 4px;
+  top: 8px;
+  width: 4px;
+  height: 4px;
   border-radius: 50%;
   background: currentColor;
-  opacity: 0.5;
+  transition: transform 0.2s ease, opacity 0.2s ease;
 }
 
-/* 本轮会话：唯一带底纹的一行 —— 它是「你刚问的这件事」的直接反馈。 */
+.dbp_spend:hover::before,
+.dbp_today:hover::before,
+.dbp_week:hover::before,
+.dbp_recent:hover::before,
+.dbp_topup:hover::before,
+.dbp_runway:hover::before {
+  transform: scale(1.3);
+  opacity: 1;
+}
+
+/* v0.5: 本轮会话突出显示 —— 唯一带底纹的一行 */
 .dbp_spend {
-  margin: 10px 0 2px;
-  padding: 6px 9px 6px 13px;
-  border-radius: 8px;
-  background: var(--dbp-surface);
+  margin: 12px 0 2px;
+  padding: 8px 12px 8px 16px;
+  border-radius: 10px;
+  background: var(--dbp-surface-elevated);
   color: var(--dsw-alias-label-secondary);
-  font-size: 12px;
-  font-weight: 500;
+  font-size: 1em;
+  font-weight: 600;
+  transition: background-color 0.2s ease, transform 0.2s ease;
+  cursor: default;
+}
+
+.dbp_spend:hover {
+  background: var(--dbp-surface);
+  transform: translateX(2px);
 }
 
 .dbp_spend::before {
-  left: 6px;
-  top: 12px;
-  opacity: 0.7;
+  left: 8px;
+  top: 11px;
+  opacity: 0.8;
+  animation: dbp-dot-blink 2s infinite;
 }
 
-/* 今日 / 本周 / 近 7 天：三层递进的统计，越远期越轻。 */
+@keyframes dbp-dot-blink {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 0.5; }
+}
+
+/* v0.5: 今日/本周/近 7 天：三层递进的时间衰减效果 */
 .dbp_today {
   color: var(--dsw-alias-label-secondary);
+  background: linear-gradient(to left, color-mix(in srgb, var(--dsw-alias-label-secondary) 3%, transparent), transparent);
+  padding-left: 18px;
 }
 
 .dbp_week {
@@ -412,50 +517,91 @@ body[data-ds-dark-theme] {
 
 .dbp_recent {
   opacity: 0.85;
+  font-size: 0.9375em;
 }
 
-/* 最近充值：入账是好消息，但不额外加重 —— 面板里带颜色的元素只在需要决策时出现。 */
+/* v0.5: 最近充值绿色标记 + 悬停反馈 */
+.dbp_topup {
+  color: var(--dbp-ok);
+  font-weight: 500;
+}
+
 .dbp_topup::before {
   background: var(--dbp-ok);
-  opacity: 0.85;
+  opacity: 0.9;
 }
 
-/* 余额跑道：预测，不是事实，视觉上比金额明细更轻。 */
+.dbp_topup:hover {
+  padding-left: 20px;
+  transition: padding-left 0.2s ease;
+}
+
+/* v0.5: 余额跑道预测信息 */
 .dbp_runway {
   opacity: 0.85;
+  font-style: italic;
 }
 
 .dbp_trend {
-  margin: 12px 0 0;
-  padding: 8px 8px 2px;
-  border: 1px solid var(--dbp-hairline);
-  border-radius: 10px;
-  background: var(--dbp-surface);
+  margin: 14px 0 2px;
+  padding: 10px 12px 4px;
+  border: 1px solid color-mix(in srgb, var(--dbp-hairline) 70%, transparent);
+  border-radius: 12px;
+  background: var(--dbp-surface-elevated);
 }
 
 .dbp_spark {
   display: block;
   width: 100%;
-  height: 46px;
+  height: 50px;
   overflow: visible;
 }
 
 .dbp_sparkLine {
   fill: none;
   stroke: var(--dsw-alias-label-tertiary);
-  stroke-width: 1.75;
+  stroke-width: 2;
   stroke-linejoin: round;
   stroke-linecap: round;
   vector-effect: non-scaling-stroke;
-  filter: drop-shadow(0 1px 1.5px color-mix(in srgb, currentColor 18%, transparent));
+  filter: drop-shadow(0 1px 2px color-mix(in srgb, currentColor 20%, transparent));
+  transition: stroke 0.3s ease;
 }
 
 .dbp_sparkArea {
-  fill: color-mix(in srgb, var(--dsw-alias-label-tertiary) 13%, transparent);
+  fill: color-mix(in srgb, var(--dsw-alias-label-tertiary) 10%, transparent);
   stroke: none;
-  /* 面积向基线淡出：实心色块会让「跌」看起来像一整块警示区，
-     渐隐之后读起来才是「线下方的一层影子」。不支持 mask 的环境会退回实心填充。 */
-  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.06));
+  /* v0.5: 更柔和的面积渐隐效果 */
+  mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.1) 60%, transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.6), rgba(0, 0, 0, 0.1) 60%, transparent 100%);
+}
+
+/*
+ * 趋势末端标记：悬停时在**最后一个样本**上点一个小圆点。
+ *
+ * 不能写成 `.dbp_spark::after`：`<svg>` 是替换元素，伪元素在 Chromium 里不生成
+ * 盒子；即便生成了，`.dbp_spark` 也没有定位上下文，圆点会相对最近的定位祖先
+ * （`position: fixed` 的面板）落到右下角，而不是折线末端。端点坐标只有
+ * `sparklinePath()` 知道，所以改由 `sparkline.js` 渲染一个 `<circle>`
+ * （v0.5.0 收尾时修正）。
+ */
+.dbp_sparkEnd {
+  fill: var(--dsw-alias-label-secondary);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+}
+
+.dbp_spark:hover .dbp_sparkEnd {
+  opacity: 1;
+}
+
+.dbp_trend[data-tone='up'] .dbp_sparkEnd {
+  fill: var(--dbp-ok);
+}
+
+.dbp_trend[data-tone='down'] .dbp_sparkEnd {
+  fill: var(--dbp-warn);
 }
 
 /* 余额在涨（充值）用 success 色，在跌（消耗）用 warning 色。 */
@@ -481,105 +627,116 @@ body[data-ds-dark-theme] {
   margin-top: 2px;
   padding: 0 2px;
   color: var(--dsw-alias-label-tertiary);
-  font-size: 10.5px;
-  line-height: 15px;
+  font-size: 0.875em;
+  line-height: 1.45;
   font-variant-numeric: tabular-nums;
 }
 
 /* ---------------------------------------------------------------- 计费时段 */
 
-/*
- * 状态行徽章上的时段标签。10.5px 是「比徽章数字小一档、但仍看得清」的尺寸。
- *
- * 底色只用一成多的透明度、外面再补一圈同色 24% 的发丝描边：档位色（绿/橙/红）
- * 说的是「钱还够不够」，时段色说的是「这个价贵不贵」，两件事不该混成一片
- * 抢注意力的色块。描边让标签在浅色底上仍有边界，但不加第二块实色。
- * 颜色取自 `:root` 的 `--dbp-peak` / `--dbp-offpeak`（面板 portal 到 body，
- * 变量挂在 `.dbp_root` 上的话面板里的徽标会取不到）。
- */
+/* v0.5: 状态行徽章上的时段标签增强 —— 更鲜明的视觉效果。底色与描边都加深，提升对比度 */
 .dbp_tariff {
   flex: none;
-  padding: 0 6px;
+  padding: 0 8px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
-  font-size: 10.5px;
-  line-height: 15px;
-  font-weight: 500;
-  letter-spacing: 0.02em;
+  border: 1px solid color-mix(in srgb, currentColor 26%, transparent);
+  /* 保持比徽章数字小一档的尺寸，但跟随宿主字号缩放*/
+  font-size: 0.82em;
+  line-height: 1.42;
+  font-weight: 600;
+  letter-spacing: 0.03em;
   white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.dbp_root[data-tariff='peak'] .dbp_tariff:hover,
+.dbp_root[data-tariff='off-peak'] .dbp_tariff:hover {
+  transform: scale(1.05);
 }
 
 .dbp_root[data-tariff='peak'] .dbp_tariff {
   color: var(--dbp-peak);
-  background-color: color-mix(in srgb, var(--dbp-peak) 12%, transparent);
+  background-color: color-mix(in srgb, var(--dbp-peak) 15%, transparent);
 }
 
 .dbp_root[data-tariff='off-peak'] .dbp_tariff {
   color: var(--dbp-offpeak);
-  background-color: color-mix(in srgb, var(--dbp-offpeak) 12%, transparent);
+  background-color: color-mix(in srgb, var(--dbp-offpeak) 15%, transparent);
 }
 
-/* 面板里的时段行：一枚徽标 + 一句结论，排在金额明细与档位提示之间。 */
+/* v0.5: 面板里的时段行 —— 增强徽标效果与间距 */
 .dbp_tariffRow {
   display: flex;
   align-items: center;
-  gap: 7px;
-  margin: 12px 0 0 3px;
+  gap: 8px;
+  margin: 14px 0 0 3px;
+  padding: 4px 0;
 }
 
 .dbp_tariffBadge {
   flex: none;
-  padding: 0 6px;
+  padding: 0 8px;
   border-radius: 999px;
-  border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
-  font-size: 11px;
-  line-height: 16px;
-  font-weight: 500;
+  border: 1px solid color-mix(in srgb, currentColor 26%, transparent);
+  font-size: 0.92em;
+  line-height: 1.43;
+  font-weight: 600;
   letter-spacing: 0.02em;
   white-space: nowrap;
+  transition: all 0.2s ease;
+}
+
+.dbp_tariffBadge[data-tariff='peak']:hover,
+.dbp_tariffBadge[data-tariff='off-peak']:hover {
+  transform: scale(1.03);
 }
 
 .dbp_tariffBadge[data-tariff='peak'] {
   color: var(--dbp-peak);
-  background: color-mix(in srgb, var(--dbp-peak) 12%, transparent);
+  background: color-mix(in srgb, var(--dbp-peak) 15%, transparent);
 }
 
 .dbp_tariffBadge[data-tariff='off-peak'] {
   color: var(--dbp-offpeak);
-  background: color-mix(in srgb, var(--dbp-offpeak) 12%, transparent);
+  background: color-mix(in srgb, var(--dbp-offpeak) 15%, transparent);
 }
 
-/* 徽标后面那句结论：长句要能换行，因此允许收缩（flex 默认 min-width:auto 会撑破面板）。 */
+/* 徽标后面那句结论：长句要能换行，因此允许收缩（flex 默认 min-width:auto 会撑破面板）*/
 .dbp_tariffNote {
   min-width: 0;
   color: var(--dsw-alias-label-secondary);
-  font-size: 11.5px;
-  line-height: 17px;
+  font-size: 0.9583em;
+  line-height: 1.5;
 }
 
 /*
- * 时段明细（倒计时 / 本段区间 / 价格 / 峰谷预估 / 日历）。
- *
- * 左边那条 2px 竖轨把这五六行收成「同一段信息」，而不是散落在面板里的一堆小字；
- * 竖轨用中性色，不参与档位/时段的配色。日历覆盖行是诊断信息，比其余行再淡一档。
+ * v0.5: 时段明细区增强 —— 更好的信息组织与视觉引导。
+ * 竖轨加粗到 3px，颜色加深；关键指标添加淡底纹。
  */
 .dbp_tariffMeta {
-  margin: 0 0 0 3px;
-  padding: 3px 0 3px 10px;
-  border-left: 2px solid var(--dbp-rail);
+  margin: 0 0 0 4px;
+  padding: 4px 0 4px 12px;
+  border-left: 3px solid var(--dbp-rail);
   color: var(--dsw-alias-label-tertiary);
-  font-size: 11.5px;
-  line-height: 17px;
+  font-size: 0.9583em;
+  line-height: 1.5;
   font-variant-numeric: tabular-nums;
+  transition: border-color 0.2s ease, padding-left 0.2s ease;
 }
 
 .dbp_tariffRow + .dbp_tariffMeta {
-  margin-top: 6px;
+  margin-top: 8px;
+}
+
+.dbp_tariffMeta:hover {
+  border-color: var(--dsw-alias-label-secondary);
+  padding-left: 14px;
 }
 
 .dbp_tariffMeta[data-balance-tariff-calendar] {
-  font-size: 10.5px;
-  opacity: 0.8;
+  font-size: 0.875em;
+  opacity: 0.75;
+  border-left: 2px solid var(--dbp-hairline);
 }
 
 .dbp_topUp {
@@ -588,24 +745,54 @@ body[data-ds-dark-theme] {
   align-items: center;
   justify-content: center;
   width: 100%;
-  height: 34px;
-  margin-top: 12px;
-  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 30%, transparent);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 7%, transparent);
+  height: 36px;
+  margin-top: 14px;
+  border: 1px solid color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 25%, transparent);
+  border-radius: 12px;
+  background: linear-gradient(135deg, 
+    color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 8%, transparent) 0%,
+    color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 5%, transparent) 100%);
   color: var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary));
-  font-size: 12.5px;
-  font-weight: 500;
+  font-size: 1.0625em;
+  font-weight: 600;
   text-decoration: none;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+
+/* v0.5: 充值按钮微光动画 */
+.dbp_topUp::before {
+  content: '';
+  position: absolute;
+  top: -50%;
+  left: -50%;
+  width: 200%;
+  height: 200%;
+  background: radial-gradient(circle at center, 
+    rgba(255, 255, 255, 0.2) 0%, 
+    transparent 70%);
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.4s ease, transform 0.4s ease;
+}
+
+.dbp_topUp:hover::before {
+  opacity: 1;
+  transform: scale(1);
 }
 
 .dbp_topUp:hover {
-  background: color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 13%, transparent);
-  border-color: color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 42%, transparent);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 20%, transparent);
+  border-color: color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 40%, transparent);
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 14%, transparent) 0%,
+    color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 9%, transparent) 100%);
 }
 
 .dbp_topUp:active {
+  transform: translateY(0);
   background: color-mix(in srgb, var(--dsw-alias-brand-text, var(--dsw-alias-state-business-primary)) 18%, transparent);
 }
 
@@ -869,6 +1056,111 @@ body[data-ds-dark-theme] {
 }
 
 /*
+ * color-mix() 降级（v0.3.1，审计 P3-7）。
+ *
+ * `color-mix()` 需要 Chromium 111+ / Safari 16.2+ / Firefox 113+。旧浏览器不认识
+ * 这个函数时，**整条声明**会被丢弃 —— 淡底、描边、档位底色、趋势面积全部消失，
+ * 只剩文字色。下面用实色 rgba 覆盖同一批选择器与三个根变量，保证旧环境里仍有
+ * 边界与层次。放在 forced-colors 之前：高对比度模式应当继续压过这些颜色。
+ */
+@supports not (color: color-mix(in srgb, red, blue)) {
+  :root {
+    --dbp-surface: rgba(127, 127, 127, 0.06);
+    --dbp-rail: rgba(127, 127, 127, 0.26);
+    --dbp-panel-border: rgba(127, 127, 127, 0.18);
+  }
+
+  body[data-ds-dark-theme] {
+    --dbp-surface: rgba(255, 255, 255, 0.06);
+    --dbp-rail: rgba(255, 255, 255, 0.18);
+    --dbp-panel-border: rgba(255, 255, 255, 0.09);
+  }
+
+  .dbp_root[data-level='warn'][data-status='ready'] .dbp_trigger,
+  .dbp_root[data-level='warn'][data-status='stale'] .dbp_trigger {
+    background-color: rgba(192, 122, 18, 0.1);
+    box-shadow: inset 0 0 0 1px rgba(192, 122, 18, 0.22);
+  }
+
+  .dbp_root[data-level='low'][data-status='ready'] .dbp_trigger,
+  .dbp_root[data-level='low'][data-status='stale'] .dbp_trigger {
+    background-color: rgba(217, 58, 69, 0.12);
+    box-shadow: inset 0 0 0 1px rgba(217, 58, 69, 0.26);
+  }
+
+  .dbp_trigger:hover {
+    background-color: rgba(127, 127, 127, 0.14);
+  }
+
+  .dbp_trigger:active {
+    background-color: rgba(127, 127, 127, 0.2);
+  }
+
+  .dbp_refresh:active:not(:disabled) {
+    background: rgba(127, 127, 127, 0.09);
+  }
+
+  .dbp_stale,
+  .dbp_setNotice {
+    background-color: rgba(192, 122, 18, 0.11);
+  }
+
+  .dbp_calendarWarn {
+    background-color: rgba(217, 58, 69, 0.1);
+  }
+
+  .dbp_sparkLine {
+    filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.18));
+  }
+
+  .dbp_sparkArea {
+    fill: rgba(127, 127, 127, 0.13);
+  }
+
+  .dbp_trend[data-tone='up'] .dbp_sparkArea {
+    fill: rgba(31, 143, 95, 0.15);
+  }
+
+  .dbp_trend[data-tone='down'] .dbp_sparkArea {
+    fill: rgba(192, 122, 18, 0.13);
+  }
+
+  .dbp_tariff,
+  .dbp_tariffBadge,
+  .dbp_alertAction {
+    border-color: rgba(127, 127, 127, 0.24);
+  }
+
+  .dbp_root[data-tariff='peak'] .dbp_tariff,
+  .dbp_tariffBadge[data-tariff='peak'] {
+    background-color: rgba(192, 122, 18, 0.12);
+  }
+
+  .dbp_root[data-tariff='off-peak'] .dbp_tariff,
+  .dbp_tariffBadge[data-tariff='off-peak'] {
+    background-color: rgba(31, 143, 95, 0.12);
+  }
+
+  .dbp_topUp {
+    border-color: rgba(77, 107, 254, 0.3);
+    background: rgba(77, 107, 254, 0.07);
+  }
+
+  .dbp_topUp:hover {
+    border-color: rgba(77, 107, 254, 0.42);
+    background: rgba(77, 107, 254, 0.13);
+  }
+
+  .dbp_topUp:active {
+    background: rgba(77, 107, 254, 0.18);
+  }
+
+  .dbp_alertAction {
+    border-color: rgba(255, 255, 255, 0.4);
+  }
+}
+
+/*
  * 强制配色模式（Windows 高对比度、部分 Linux 主题）：color-mix 的颜色会被系统
  * 覆盖成 Canvas/CanvasText，淡底与阴影全部消失。这里补上实线边界，保证面板、
  * 按钮与时段竖轨在「没有颜色」的世界里仍然分得清层次。
@@ -890,7 +1182,8 @@ body[data-ds-dark-theme] {
   }
 
   .dbp_tariffMeta,
-  .dbp_stale {
+  .dbp_stale,
+  .dbp_calendarWarn {
     border-left-color: CanvasText;
   }
 

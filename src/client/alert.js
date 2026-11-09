@@ -161,6 +161,47 @@ export function deserializeAlertState(raw) {
 }
 
 /**
+ * 提醒状态的存储键（审计 P3-3）。
+ *
+ * 序列化函数此前是死代码：状态机只活在 `service.balanceAlertState` 里，刷新页面
+ * 就重置 ——「30 分钟冷却 / 已提醒档位」全部丢失，与 README 承诺的「同一档位
+ * 只提醒一次 + 全局冷却」不符。接到存储上之后，刷新页面仍记得刚刚提醒过什么。
+ */
+export const ALERT_KEY = 'dsh-balance-pill:alert'
+
+/**
+ * 读取持久化的提醒状态；没有记录或损坏时回到初始状态。
+ * @param storage - 形如 localStorage 的对象。
+ * @returns 提醒状态。
+ */
+export function loadAlertState(storage) {
+  if (storage === undefined || storage === null) return createAlertState()
+  try {
+    const raw = typeof storage.getItem === 'function' ? storage.getItem(ALERT_KEY) : null
+    if (typeof raw !== 'string' || raw === '') return createAlertState()
+    return deserializeAlertState(JSON.parse(raw))
+  } catch {
+    return createAlertState()
+  }
+}
+
+/**
+ * 写入提醒状态；失败静默（提醒状态不是关键路径）。
+ * @param state - 提醒状态。
+ * @param storage - 形如 localStorage 的对象。
+ * @returns 是否写入成功。
+ */
+export function saveAlertState(state, storage) {
+  if (storage === undefined || storage === null) return false
+  try {
+    storage.setItem(ALERT_KEY, JSON.stringify(serializeAlertState(state)))
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * 「当前要显示的提醒」的小仓库。
  *
  * 之所以要有它，而不是把提醒直接放在徽章组件的 state 里：徽章挂在
